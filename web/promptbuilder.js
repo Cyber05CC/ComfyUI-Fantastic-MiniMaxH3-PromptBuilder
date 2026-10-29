@@ -1,0 +1,7409 @@
+/* MiniMax H3 Prompt Builder — frontend
+ * Compact node summary + "Edit prompt" button opening a modal template editor.
+ * Formats follow MiniMax's official prompt-writing guides shipped with the
+ * open-weight release (VIDEO_PROMPT_WRITING_GUIDE_base_en / _ref_en).
+ */
+import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
+import { LOADER_NAME, computeTags, viewURL as loaderViewURL,
+  safeCanvasFocus, openLoaderModal, isOn, postApi, outputTargets, originNode, linkNodes, keepNameChars,
+  overlayOn, maskOverlay, refTokenEstimate, itemLook, picturePreview, clipPreview, miniPlayer, lightbox,
+  injectCSS as injectLoaderCSS } from "./medialoader.js";
+import { STACK_NAME, ENCODE_NAMES, readStack, deriveEntries, labelGroups,
+  rangeText as refmodRange, previewURL as refmodPreviewURL, KIND as REFMOD_KIND,
+  openStackModal, refreshStackLabels } from "./refmodstack.js";
+
+const NODE_NAME = "MiniMaxH3PromptBuilder";
+
+/* Delivery tags — community findings, not from MiniMax's published guide.
+ * They go INSIDE a <d> block to shape performance. Kept in one table so the
+ * picker, the hover preview and section 6.1 of the bundled guide can never
+ * drift apart; if you edit this list, edit the guide's table to match.
+ *
+ * `wrap: true` marks a tag that surrounds text rather than standing alone:
+ * inserting one wraps the selection, or drops the caret between the halves. */
+const DELIVERY_TAGS = [
+  { group: "Pauses and breath", tag: "<pause>", what: "Short pause",
+    ex: "Okay, so. <pause> This is just me talking." },
+  { group: "Pauses and breath", tag: "<long pause>", what: "Longer pause",
+    ex: "I mean\u2026 <long pause> I don't even know." },
+  { group: "Pauses and breath", tag: "<breath>", what: "Breathing sound",
+    ex: "And then\u2026 <breath> it just happened." },
+  { group: "Pauses and breath", tag: "<inhale>", what: "In breath",
+    ex: "<inhale> Alright, let's do this." },
+  { group: "Pauses and breath", tag: "<exhale>", what: "Out breath",
+    ex: "<exhale> Fine. Have it your way." },
+  { group: "Pauses and breath", tag: "<catches breath>", what: "Out of breath",
+    ex: "Wait\u2026 <catches breath> hold on a sec." },
+  { group: "Pauses and breath", tag: "<deep breath>", what: "Calming down",
+    ex: "<deep breath> Okay. I can do this." },
+
+  { group: "Delivery and emphasis", tag: "<i>", what: "Emphasize 1\u20134 words",
+    ex: "I was <i>not</i> expecting that.", wrap: true },
+  { group: "Delivery and emphasis", tag: "<whisper>", what: "Whisper delivery",
+    ex: "<whisper> Don't tell anyone this.</whisper>", wrap: true },
+  { group: "Delivery and emphasis", tag: "<softer>", what: "Quieter delivery",
+    ex: "<softer> I don't think I can say it." },
+  { group: "Delivery and emphasis", tag: "<humming>", what: "Humming a tune",
+    ex: "<humming> da-da-da-beautiful-day.</humming>", wrap: true },
+  { group: "Delivery and emphasis", tag: "<stutter>", what: "Stutters the words",
+    ex: "<stutter> I ca can't believe that." },
+  { group: "Delivery and emphasis", tag: "<uh>", what: "Filler / hesitation",
+    ex: "So, like\u2026 <uh> what was I saying?" },
+
+  { group: "Non-verbal sounds", tag: "<laughs>", what: "Laughing",
+    ex: "That's\u2026 <laughs> that's actually funny." },
+  { group: "Non-verbal sounds", tag: "<chuckle>", what: "Small laugh",
+    ex: "<chuckle> You're not serious." },
+  { group: "Non-verbal sounds", tag: "<sighs>", what: "Sigh",
+    ex: "<sighs> I really tried." },
+  { group: "Non-verbal sounds", tag: "<gasp>", what: "Sharp intake",
+    ex: "<gasp> Oh my God." },
+  { group: "Non-verbal sounds", tag: "<coughs>", what: "Cough",
+    ex: "<coughs> Sorry, one sec." },
+  { group: "Non-verbal sounds", tag: "<clears throat>", what: "Throat clear",
+    ex: "<clears throat> So anyway\u2026" },
+  { group: "Non-verbal sounds", tag: "<sniff>", what: "Sniffing",
+    ex: "<sniff> It's just\u2026 really sad." },
+  { group: "Non-verbal sounds", tag: "<mhm>", what: "Agreement sound",
+    ex: "Yeah, <mhm> exactly." },
+  { group: "Non-verbal sounds", tag: "<phew>", what: "Relief",
+    ex: "<phew> That was close." },
+];
+
+/* ------------------------------------------------------------------ */
+/* Reference data straight from the guides                             */
+/* ------------------------------------------------------------------ */
+
+// What each mode actually sends once saved — mirrors MODE_LIMITS in nodes.py.
+// Reference tags the editor knows how to chip: <Picture 1>, <Video 2>,
+// <Audio 3>, <Subject 1>.
+const TAG_RE = /<(?:Picture|Video|Audio|Subject) \d+>/g;
+
+/* One pass over a field paints three things: dialogue blocks, reference tags
+   and speaker IDs. Dialogue is matched first so tags inside a spoken line
+   aren't chipped out of it. */
+/* The character that turns a subject's name into shorthand (!Bob). It's a
+   per-user editor preference, picked from symbols that mean nothing else in
+   an H3 prompt, so the patterns below are rebuilt when it changes. */
+const NAME_PREFIXES = ["!", "@", "#", "$", "%", "&", "*", "~", "+", "=", "^"];
+let NAME_PREFIX = "!";
+const reEsc = (c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+let PAINT_RE, NAME_TOKEN_RE, NAME_SPLIT_RE;
+function setNamePrefix(ch) {
+  NAME_PREFIX = NAME_PREFIXES.includes(ch) ? ch : "!";
+  const p = reEsc(NAME_PREFIX);
+  PAINT_RE = new RegExp([
+    "<d>[\\s\\S]*?<\\/d>",                      // a spoken line
+    // a cut marker, with its timestamp when one follows
+    "\\[Shot \\d+\\](?:\\s+at\\s+\\d{1,2}:\\d{2}(?:\\.\\d{1,3})?)?",
+    "<(?:Picture|Video|Audio|Subject) \\d+>",     // a reference tag
+    "\\(S\\d+(?:\\s*,\\s*S\\d+)*\\)",           // (S1) or (S1,S2)
+    `${p}[A-Za-z][\\w-]*`,                        // !Name shorthand for a named subject
+  ].join("|"), "g");
+  NAME_TOKEN_RE = new RegExp(`${p}([A-Za-z][\\w-]*)`, "g");
+  NAME_SPLIT_RE = new RegExp(`(${p}[A-Za-z][\\w-]*)`);
+}
+setNamePrefix("!");
+
+/** Named subjects from the switched-on definition lines that carry a name,
+ *  keyed by the lower-cased name so !bob, !Bob and !BOB all find "Bob":
+ *  { bob: { tag: "<Subject 1>", name: "Bob" } }. */
+function subjectNames(state) {
+  const out = {};
+  for (const d of state?.ref?.subjectDefs || []) {
+    if (d.off) continue;
+    const name = (d.name || "").trim();
+    const m = (d.text || "").trim().match(/^<Subject (\d+)>/);
+    const key = name.toLowerCase();
+    if (name && m && /^[A-Za-z][\w-]*$/.test(name) && !(key in out)) out[key] = { tag: `<Subject ${m[1]}>`, name };
+  }
+  return out;
+}
+const lookupName = (names, raw) => names[String(raw || "").toLowerCase()];
+
+/** A description saved with a RefMod or typed in a voice box, as one line
+ *  (a break reads as a shot cut) with no trailing full stop. */
+const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim().replace(/[\s.]+$/, "");
+/** "low, husky voice" -> "a low, husky voice"; kept as typed with an article. */
+const withArticle = (t) => (/^(a|an|the)\s/i.test(t) ? t : (/^[aeiou]/i.test(t) ? "an " : "a ") + t);
+/** "a low, husky voice" -> "low, husky voice", for "in the … referenced from". */
+const noArticle = (t) => t.replace(/^(a|an|the)\s+/i, "");
+/** A voice-timbre line ties a speaker ID to a subject: "<Audio 1> is the
+ *  voice-timbre reference for <Subject 1> (S1), …". Singing lines don't
+ *  count. Returns { audio, subj, sx } or null. */
+function voiceBinding(text) {
+  const t = String(text || "");
+  const a = t.match(/^\s*<Audio (\d+)>/);
+  const s = t.match(/\((S\d+)\)/);
+  if (!a || !s || /singing/i.test(t)) return null;
+  const subj = t.match(/<Subject \d+>/);
+  return { audio: `<Audio ${a[1]}>`, subj: subj ? subj[0] : null, sx: s[1] };
+}
+
+/* Right-click a tag: the tags a text holds, and how to rewrite them. */
+
+/** Reference tags, !Name shorthand and speaker IDs in a text, in order. */
+function tagTokens(text) {
+  const t = String(text || ""), out = [];
+  for (const m of t.matchAll(/<(?:Subject|Picture|Video|Audio) \d+>/g))
+    out.push({ tok: m[0], start: m.index, end: m.index + m[0].length });
+  for (const m of t.matchAll(NAME_TOKEN_RE))
+    out.push({ tok: m[0], start: m.index, end: m.index + m[0].length });
+  for (const m of t.matchAll(/\(S\d+(?:\s*,\s*S\d+)*\)/g))
+    out.push({ tok: m[0], start: m.index, end: m.index + m[0].length });
+  return out.sort((a, b) => a.start - b.start);
+}
+const isSpk = (tok) => tok.startsWith("(");
+const spkIds = (tok) => tok.match(/S\d+/g) || [];
+/** "(S2,S1)" from ids, in number order; "" when none are left. */
+const spkTok = (ids) => {
+  const sorted = [...new Set(ids)].sort((a, b) => +a.slice(1) - +b.slice(1));
+  return sorted.length ? `(${sorted.join(",")})` : "";
+};
+/** Same tag: exact for labels, any case for names (!ann is !Ann), the same
+ *  IDs for speakers whatever the spacing. */
+const sameTok = (a, b) => {
+  if (isSpk(a) || isSpk(b)) return isSpk(a) && isSpk(b) && spkTok(spkIds(a)) === spkTok(spkIds(b));
+  return (a.startsWith("<") || b.startsWith("<")) ? a === b : a.toLowerCase() === b.toLowerCase();
+};
+/** Copies of a tag. A single speaker ID also counts inside group tags. */
+const countTok = (text, tok) => {
+  if (isSpk(tok) && spkIds(tok).length === 1)
+    return tagTokens(text).filter((t) => isSpk(t.tok) && spkIds(t.tok).includes(spkIds(tok)[0])).length;
+  return tagTokens(text).filter((t) => sameTok(t.tok, tok)).length;
+};
+const tagClass = (tok) => (tok.startsWith("<") ? tok.match(/^<(\w+)/)[1] : isSpk(tok) ? "Speaker" : "Name");
+const TAG_CLASS_LABEL = { Picture: "picture", Video: "video", Audio: "audio", Subject: "subject",
+  Name: "subject name", Speaker: "speaker ID" };
+
+/** Close the gaps removed tags leave behind. "!" is left alone: it starts
+ *  a name, and pulling it onto the previous word would break the name. */
+const tidyGaps = (t) => t.replace(/[ \t]{2,}/g, " ").replace(/[ \t]+([,.;:?)])/g, "$1")
+  .replace(/\(\s*\)/g, "").replace(/^[ \t]+|[ \t]+$/gm, "");
+
+/** Replace every copy of tok with target (remove it when target is null).
+ *  With swap, copies of target become `back` (tok as the prompt spells it). */
+function rewriteTokens(text, tok, target, swap, back = tok, ctx = null) {
+  let out = "", last = 0;
+  // One speaker ID is rewritten wherever it appears, group tags included:
+  // swapping S1 and S2 turns "(S1,S2)" into "(S2,S1)", removing S2 leaves "(S1)".
+  const byId = isSpk(tok) && spkIds(tok).length === 1 && (target == null || (isSpk(target) && spkIds(target).length === 1));
+  const from = byId ? spkIds(tok)[0] : null, to = byId && target != null ? spkIds(target)[0] : null;
+  if (byId && ctx) {
+    // A line from a speaker button — "!Ann (S1), in the low voice referenced
+    // from <Audio 1>, says:" — belongs to its speaker as a whole. When the ID
+    // changes hands, the name and voice clause follow the new speaker's voice
+    // line; removing the ID drops the clause and keeps the name. Only wording
+    // that matches the old speaker's voice line is touched.
+    const P = reEsc(ctx.prefix);
+    const re = new RegExp(`(?:${P}([A-Za-z][\\w-]*) )?\\((S\\d+)\\)(, in the [^<\\n]+? referenced from (<Audio \\d+>),)?`, "g");
+    text = text.replace(re, (m, name, id, clause, audio) => {
+      const Y = id === from ? to : (swap && id === to ? from : undefined);
+      if (Y === undefined) return m;
+      const bx = ctx.bindings[id] || null, by = Y ? ctx.bindings[Y] || null : null;
+      let who = name ? `${ctx.prefix}${name} ` : "";
+      if (Y && name && bx?.name && name.toLowerCase() === bx.name.toLowerCase())
+        who = by?.name ? `${ctx.prefix}${by.name} ` : "";
+      let how = clause || "";
+      if (clause && bx?.audio && audio === bx.audio)
+        how = Y && by?.voice && by?.audio ? `, in the ${noArticle(by.voice)} referenced from ${by.audio},` : "";
+      return who + (Y ? `(${Y})` : "") + how;
+    });
+  }
+  for (const t of tagTokens(text)) {
+    let rep = null;
+    if (byId && isSpk(t.tok)) {
+      const ids = spkIds(t.tok);
+      if (ctx && ids.length === 1) continue;           // handled with its line above
+      if (!ids.includes(from) && !(swap && to && ids.includes(to))) continue;
+      rep = spkTok(ids.map((id) => id === from ? to : (swap && id === to ? from : id)).filter(Boolean));
+    } else if (sameTok(t.tok, tok)) rep = target ?? "";
+    else if (swap && target != null && sameTok(t.tok, target)) rep = back;
+    if (rep === null) continue;
+    out += text.slice(last, t.start) + rep;
+    last = t.end;
+  }
+  out += text.slice(last);
+  return target == null ? tidyGaps(out) : out;
+}
+
+/** A single removed tag takes one neighbouring space with it. */
+function tidyRange(text, start, end) {
+  const before = text[start - 1], after = text[end];
+  if (before === " " && (after === undefined || after === " " || after === "\n" || /[,.;:?)]/.test(after)))
+    return { start: start - 1, end };
+  if (after === " " && (start === 0 || before === "\n" || before === "("))
+    return { start, end: end + 1 };
+  return { start, end };
+}
+
+/** Show a name suggestion in a chip field's mirror, at a text offset. A
+ *  partly typed !name is painted as its own chip, so the suggestion goes
+ *  after that chip rather than inside it. */
+function insertGhost(root, pos, text) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let seen = 0, node;
+  while ((node = walker.nextNode())) {
+    const len = node.nodeValue.length;
+    if (seen + len >= pos) {
+      const off = pos - seen;
+      const ghost = el("span", { class: "mmh3-ghost" }, text);
+      const parent = node.parentNode;
+      if (off === len && parent !== root && parent.classList?.contains("mmh3-reftag")) { parent.after(ghost); return; }
+      parent.insertBefore(ghost, node.splitText(off));
+      return;
+    }
+    seen += len;
+  }
+}
+
+/** Edit a field through the browser so Ctrl+Z undoes it, falling back to
+ *  setting the value. Either way the field's own input handler runs. */
+function editField(box, start, end, text) {
+  const v = box.value, want = v.slice(0, start) + text + v.slice(end);
+  box.focus();
+  box.setSelectionRange(start, end);
+  let ok = false;
+  try { ok = document.execCommand(text ? "insertText" : "delete", false, text); } catch (e) { ok = false; }
+  if (!ok || box.value !== want) {
+    box.value = want;
+    box.setSelectionRange(start + text.length, start + text.length);
+    box.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+}
+
+/** Turn every !Name into "<Subject N> Name" — or just "Name" inside a
+ *  spoken <d> line, where a label would be read aloud. The name is written
+ *  as it was defined, whatever case was typed. Unknown names are left as
+ *  typed so the warning can point at them. */
+function expandNames(text, names) {
+  if (!text || !Object.keys(names).length) return text;
+  const parts = String(text).split(/(<d>[\s\S]*?<\/d>)/);
+  return parts.map((part, i) => part.replace(NAME_TOKEN_RE, (m, raw) => {
+    const hit = lookupName(names, raw);
+    return hit ? (i % 2 ? hit.name : `${hit.tag} ${hit.name}`) : m;
+  })).join("");
+}
+
+const LANG_RE = /^(\s*\[[^\]\n]+\])/;
+/* Every delivery tag, opening or closing, as one alternation — for picking
+ * them out of a <d> line so the mirror and the picker's example can colour
+ * them. Longer names first so "<long pause>" isn't cut to "<pause>". */
+const DELIVERY_RE = new RegExp("(<\\/?(?:" + [...new Set(DELIVERY_TAGS.map((t) => t.tag.slice(1, -1)))]
+  .sort((a, b) => b.length - a.length).map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|") + ")>)", "g");
+
+/** Text with its delivery tags wrapped as .mmh3-dtag spans, and any !Name
+ *  shorthand as a subject tag (it becomes the bare name in a spoken line). */
+function deliverySpans(text, names = null) {
+  // split() with a capture group alternates text, tag, text… — the parity
+  // is what says which is which, so empties are dropped only afterwards.
+  return String(text).split(DELIVERY_RE)
+    .flatMap((part, i) => {
+      if (i % 2) return [el("span", { class: "mmh3-dtag" }, part)];
+      if (!names) return [part];
+      return part.split(NAME_SPLIT_RE).map((p, j) => {
+        if (!(j % 2)) return p;
+        const hit = lookupName(names, p.slice(1));
+        return el("span", { class: "mmh3-reftag " + (hit ? "subj" : "unknown"), dataset: { tag: p },
+          title: hit ? `just \u201c${hit.name}\u201d when spoken` : "No subject has this name" }, p);
+      });
+    })
+    .filter((part) => part !== "");
+}
+
+const MODE_SENDS = {
+  T2VA: "Sends: prompt only \u2014 no reference media leaves the node in this mode.",
+  I2VA: "Sends: prompt + picture 1 (first frame). All other media is withheld.",
+  L2VA: "Sends: prompt + picture 1 (last frame). All other media is withheld.",
+  FL2VA: "Sends: prompt + pictures 1\u20132 (first & last frame). All other media is withheld.",
+  REF: "Sends: prompt + every enabled reference.",
+};
+
+const MODES = [
+  { id: "T2VA", label: "T2VA", hint: "Text → video+audio" },
+  { id: "I2VA", label: "I2VA", hint: "First frame → video" },
+  { id: "FL2VA", label: "FL2VA", hint: "First + last frame" },
+  { id: "L2VA", label: "L2VA", hint: "Last frame → video" },
+  { id: "REF", label: "Reference", hint: "Full-reference (ref2va)" },
+];
+
+const CAMERA_MOVES = [
+  ["Zoom In", "The camera zooms in"],
+  ["Zoom Out", "The camera zooms out"],
+  ["Push In", "The camera pushes in"],
+  ["Pull Out", "The camera pulls out"],
+  ["Pan Left", "The camera pans left"],
+  ["Pan Right", "The camera pans right"],
+  ["Truck Left", "The camera trucks left"],
+  ["Truck Right", "The camera trucks right"],
+  ["Tilt Up", "The camera tilts up"],
+  ["Tilt Down", "The camera tilts down"],
+  ["Pedestal Up", "The camera pedestals up"],
+  ["Pedestal Down", "The camera pedestals down"],
+  ["Arc Shot", "The camera arcs around the subject"],
+  ["Tracking Shot", "The camera tracks the moving subject"],
+  ["Static Shot", "The camera holds a static shot"],
+  ["Shake Slightly", "The camera shakes slightly"],
+  ["Shake Strongly", "The camera shakes strongly"],
+  ["POV", "The shot holds the subject's point of view"],
+  ["Roll Clockwise", "The camera rolls clockwise"],
+  ["Roll Counterclockwise", "The camera rolls counterclockwise"],
+];
+
+const STYLES = [
+  "Cinematic", "live-action", "2D-animated", "3D CG",
+  "claymation", "watercolor", "vintage film",
+];
+
+const LANGS = [
+  "English", "Chinese", "Japanese", "Korean", "French", "German",
+  "Italian", "Spanish", "Portuguese", "Russian", "Arabic",
+];
+
+const TASK_TYPES = [
+  "keyframe completion", "reference generation", "video editing",
+  "video continuation", "audio reuse", "audio reference",
+];
+
+const VISUAL_MARKERS = [
+  "fully_preserved", "partially_preserved", "attribute_transfer", "weak_reference",
+];
+const AUDIO_MARKERS = ["fully_copy", "partially_copy", "reference", "weak_reference"];
+
+
+/* Picture reference roles (guide §2.2.2 / §2.3 / §2.4.1).
+   A standalone <Picture N> line is for a picture playing a role in its own
+   right — a frame anchor, a layout, a look. A picture that just shows what a
+   character looks like belongs cited inside that subject's line instead, so
+   there is deliberately no "identity" chip here. */
+const PICTURE_ROLES = [
+  {
+    id: "first", label: "First frame",
+    title: "The image is the opening frame of a shot",
+    marker: "fully_preserved", task: "keyframe completion",
+    text: (c) => `<Picture ${c.n}> is the first frame of [Shot ${c.shot}], ` +
+      "showing ",
+    note: (c) => `it is used as the opening frame of [Shot ${c.shot}] exactly as given.`,
+    context: (c) => `[Shot ${c.shot}] first frame`,
+  },
+  {
+    id: "last", label: "Last frame",
+    title: "The image is the closing frame of a shot",
+    marker: "fully_preserved", task: "keyframe completion",
+    text: (c) => `<Picture ${c.n}> is the last frame of [Shot ${c.shot}], ` +
+      "showing ",
+    note: (c) => `it is used as the closing frame of [Shot ${c.shot}] exactly as given.`,
+    context: (c) => `[Shot ${c.shot}] last frame`,
+  },
+  {
+    id: "composition", label: "Composition",
+    title: "Framing, layout and camera position are echoed; content is not copied",
+    marker: "weak_reference", task: "reference generation",
+    text: (c) => `<Picture ${c.n}> is a composition reference for [Shot ${c.shot}] ` +
+      "\u2014 its framing, subject placement and camera height are echoed; " +
+      "its own content is not reproduced.",
+    note: () => "only the framing and layout are echoed; its subjects and " +
+      "setting are not reproduced.",
+    context: (c) => `[Shot ${c.shot}] framing`,
+  },
+  {
+    id: "style", label: "Look / style",
+    title: "Palette, grade and lighting character are echoed",
+    marker: "weak_reference", task: "reference generation",
+    text: (c) => `<Picture ${c.n}> is a look reference \u2014 its palette, ` +
+      "contrast and lighting character guide the grade of the target video; " +
+      "its subjects and layout are not used.",
+    note: () => "only its palette, contrast and lighting character carry over.",
+    context: () => "look and grade",
+  },
+  {
+    id: "setting", label: "Setting",
+    title: "The location or environment the shot takes place in",
+    marker: "partially_preserved", task: "reference generation",
+    text: (c) => `<Picture ${c.n}> is the setting reference \u2014 the target ` +
+      "video takes place in this location, seen from other angles as the " +
+      "camera moves.",
+    note: () => "the location is kept; framing and viewpoint change with the " +
+      "camera.",
+    context: () => "location",
+  },
+  {
+    id: "attribute", label: "Attribute \u2192 subject",
+    title: "A garment, hairstyle or marking from this picture is worn by a subject",
+    marker: "attribute_transfer", task: "reference generation", needsSubject: true,
+    text: (c) => `<Picture ${c.n}> supplies the ` +
+      `\u2039describe the garment / hairstyle / marking\u203a worn by ${c.subj}; ` +
+      "nothing else from this picture is used.",
+    note: (c) => `the named attribute is transferred to ${c.subj}, whose own ` +
+      "identity is unchanged.",
+    context: (c) => `attribute for ${c.subj}`,
+  },
+  {
+    id: "storyboard", label: "Storyboard",
+    title: "A panel showing a beat the shot should hit, not an exact frame",
+    marker: "weak_reference", task: "reference generation",
+    text: (c) => `<Picture ${c.n}> is a storyboard panel for [Shot ${c.shot}] ` +
+      "\u2014 it shows the beat to hit, not an exact frame to reproduce.",
+    note: (c) => `it guides the staging of [Shot ${c.shot}] without being ` +
+      "reproduced as a frame.",
+    context: (c) => `[Shot ${c.shot}] staging`,
+  },
+];
+
+/* Audio reference roles (guide §2.2.4 / §2.4.2 / §2.3).
+   Each role knows how to phrase the definition, which retention marker it
+   implies, and which summary task type it belongs to. */
+const AUDIO_ROLES = [
+  {
+    id: "timbre", label: "Voice timbre \u2192 subject",
+    title: "Reference a speaker's voice timbre and delivery for a defined subject",
+    marker: "reference", task: "audio reference", needsSubject: true,
+    text: (c) => `<Audio ${c.n}> is the voice-timbre reference for ${c.subj} (${c.sx}), ` +
+      "guiding delivery and speaking rate without copying the original signal.",
+    note: (c) => `its vocal timbre guides the dialogue delivery of ${c.subj} ` +
+      "without copying the original signal.",
+  },
+  {
+    id: "vidtrack", label: "Video's synced track",
+    title: "The enabled synchronized audio track of a reference video",
+    marker: "partially_copy", task: "audio reuse", needsVideo: true,
+    text: (c) => `<Audio ${c.n}> is the synchronized audio track of ${c.vid} ` +
+      "and is reused in the target video.",
+    note: (c) => `the audio layers carried over from ${c.vid} remain audible in ` +
+      "the target video.",
+  },
+  {
+    id: "fullcopy", label: "Full 1:1 reuse",
+    title: "The complete source audio becomes the target video's complete final track",
+    marker: "fully_copy", task: "audio reuse",
+    text: (c) => `<Audio ${c.n}> is reused in full as the target video's complete ` +
+      "final audio track.",
+    note: (c) => `<Audio ${c.n}> is reused 1:1 as the target video's complete final ` +
+      "audio track.",
+  },
+  {
+    id: "music", label: "Music style",
+    title: "Reference a background-music style for the audience-only score",
+    marker: "reference", task: "audio reference",
+    text: (c) => `<Audio ${c.n}> is the background-music style reference for the ` +
+      "target video's audience-only score.",
+    note: () => "only its instrumentation, tempo, and rhythmic feel guide the new " +
+      "score; the signal is not copied.",
+  },
+  {
+    id: "lines", label: "Dialogue / lyrics",
+    title: "Reuse the spoken or sung content from the source audio",
+    marker: "partially_copy", task: "audio reuse",
+    text: (c) => `<Audio ${c.n}> provides the spoken content reused verbatim in the ` +
+      "target video, preserving its original wording and language.",
+    note: () => "its dialogue content is carried into the target video verbatim.",
+  },
+  {
+    id: "sfx", label: "Sound effects",
+    title: "Reference the sound-effect texture only",
+    marker: "reference", task: "audio reference",
+    text: (c) => `<Audio ${c.n}> is the sound-effect texture reference for the ` +
+      "target video's physical action sounds.",
+    note: () => "only its sound-effect texture is referenced; the signal is not copied.",
+  },
+  {
+    id: "beat", label: "Beat / continuity",
+    title: "Reference beat, rhythm, or audio continuity",
+    marker: "reference", task: "audio reference",
+    text: (c) => `<Audio ${c.n}> is the beat and rhythm reference guiding the target ` +
+      "video's pacing and audio continuity.",
+    note: () => "only its beat, rhythm, and continuity guide the target video's pacing.",
+  },
+];
+
+/* What each mode can actually consume, and what each slot means there.
+   Base modes have no reference slots at all — their pictures are the native
+   node's first_frame / last_frame. Reference mode takes up to 9 images,
+   3 videos, and 3 audios, capped at 12 files in total. */
+const MODE_CAPACITY = {
+  T2VA: { Picture: 0, Video: 0, Audio: 0, roles: {} },
+  I2VA: { Picture: 1, Video: 0, Audio: 0, roles: { "Picture 1": "first frame" } },
+  FL2VA: { Picture: 2, Video: 0, Audio: 0,
+    roles: { "Picture 1": "first frame", "Picture 2": "last frame" } },
+  L2VA: { Picture: 1, Video: 0, Audio: 0, roles: { "Picture 1": "last frame" } },
+  REF: { Picture: 9, Video: 3, Audio: 3, total: 12, roles: {} },
+};
+
+/* Roles a definition line states outright. Used to seed a sensible marker and
+   an example note — never to overwrite anything the user has written, since a
+   definition constrains the marker but does not determine it. */
+const ROLE_HINTS = [
+  { re: /voice[- ]timbre|voice reference|timbre reference/i, marker: "reference",
+    note: "its vocal timbre guides the delivery without copying the original signal." },
+  { re: /music[- ]style|background-music style|score reference/i, marker: "reference",
+    note: "only its instrumentation, tempo, and dynamics guide the new score." },
+  { re: /synchroni[sz]ed audio track|soundtrack of/i, marker: "partially_copy",
+    note: "the audio layers carried over from that video remain audible." },
+  { re: /reused in full|1:1|complete final audio track/i, marker: "fully_copy",
+    note: "reused as the target video's complete final audio track." },
+  { re: /beat and rhythm|audio continuity/i, marker: "reference",
+    note: "only its beat and rhythm guide the target video's pacing." },
+  { re: /sound-effect texture/i, marker: "reference",
+    note: "only its sound-effect texture is referenced; the signal is not copied." },
+  { re: /storyboard/i, marker: "weak_reference",
+    note: "its viewpoint, subject placement, and shot order are followed." },
+  { re: /first frame|last frame|keyframe/i, marker: "fully_preserved",
+    note: "the frame is reproduced exactly at that point in the target video." },
+  { re: /source video for the target video edit|edited version/i,
+    marker: "partially_preserved",
+    note: "the source structure is retained where the edit does not change it." },
+];
+
+/* What a RefMod's saved concept says about it, in the guide's own wording.
+   `subject` lines open with <Subject N>; the others are standalone reference
+   lines. Concept names are the library's (refmods.CONCEPT_TYPES). */
+const REFMOD_CONCEPTS = {
+  identity: { subject: true, marker: "fully_preserved", task: "reference generation",
+    text: (c) => `${c.subj} is the person in ${c.tag}.`,
+    note: (c) => `${c.subj}'s identity and appearance from ${c.tag} are retained. Face, facial features, body type.` },
+  clothing: { subject: true, marker: "attribute_transfer", task: "reference generation",
+    text: (c) => `${c.subj} is the outfit in ${c.tag}.`,
+    note: (c) => `the garments, colours and fit of ${c.subj} from ${c.tag} are transferred.` },
+  background: { subject: true, marker: "fully_preserved", task: "reference generation",
+    text: (c) => `${c.subj} is the environment in ${c.tag}.`,
+    note: (c) => `the layout, surfaces and lighting of ${c.subj} from ${c.tag} are retained.` },
+  style: { subject: false, marker: "attribute_transfer", task: "reference generation",
+    text: (c) => `${c.tag} is the visual-style reference; its palette, lighting and rendering look guide the target video.`,
+    note: (c) => `its colour palette, lighting and rendering style are transferred; its content is not reproduced.` },
+  pose_motion: { subject: false, marker: "attribute_transfer", task: "reference generation",
+    text: (c) => `${c.tag} is the pose and motion reference; its movement and timing guide the target video.`,
+    note: (c) => `its poses and motion timing are transferred; its subject is not reproduced.` },
+  voice: { audio: true, marker: "reference", task: "audio reference",
+    text: (c) => `${c.tag} is the voice-timbre reference for ${c.subj} (${c.sx}), guiding delivery and speaking rate without copying the original signal.`,
+    note: (c) => `its vocal timbre guides the dialogue delivery of ${c.subj} without copying the original signal.`,
+    speaker: (c) => `${c.subj} is the speaker heard in ${c.tag}.` },
+  singing: { audio: true, marker: "reference", task: "audio reference",
+    text: (c) => `${c.tag} is the singing-voice timbre reference for ${c.subj} (${c.sx}), guiding vocal tone without copying the original signal.`,
+    note: (c) => `its singing timbre guides the vocal delivery of ${c.subj} without copying the original signal.`,
+    speaker: (c) => `${c.subj} is the singer heard in ${c.tag}.` },
+  music_style: { audio: true, marker: "reference", task: "audio reference",
+    text: (c) => `${c.tag} is the background-music style reference for the target video's audience-only score.`,
+    note: () => "only its instrumentation, tempo, and rhythmic feel guide the new score; the signal is not copied." },
+  sound_fx: { audio: true, marker: "reference", task: "audio reference",
+    text: (c) => `${c.tag} is the sound-effect texture reference for the target video's physical action sounds.`,
+    note: () => "only its sound-effect texture is referenced; the signal is not copied." },
+  ambience: { audio: true, marker: "reference", task: "audio reference",
+    text: (c) => `${c.tag} is the ambience reference for the target video's background sound.`,
+    note: () => "only its ambient texture is referenced; the signal is not copied." },
+};
+const VISUAL_CONCEPTS = ["identity", "clothing", "background", "style", "pose_motion"];
+const AUDIO_CONCEPTS = ["voice", "singing", "music_style", "sound_fx", "ambience"];
+const CONCEPT_LABEL = { identity: "a person / character", clothing: "an outfit", background: "a place / setting",
+  style: "a visual style", pose_motion: "a pose or motion", voice: "a speaking voice", singing: "a singing voice",
+  music_style: "a music style", sound_fx: "sound effects", ambience: "ambience" };
+
+function roleHint(text) {
+  return ROLE_HINTS.find((h) => h.re.test(text || "")) || null;
+}
+
+/** The definition line that defines this label, if there is one. */
+function definitionFor(state, label) {
+  const line = (state.ref?.subjectDefs || [])
+    .find((d) => !d.off && (d.text || "").trim().startsWith(label));
+  return line ? line.text : "";
+}
+
+const TAG_CLASS = { Subject: "subj", Picture: "pic", Video: "vid", Audio: "aud" };
+
+/* ------------------------------------------------------------------ */
+/* Small DOM helpers                                                   */
+/* ------------------------------------------------------------------ */
+
+/* Editor preferences. Kept in localStorage so they follow the person rather
+   than the workflow — they're about how the window behaves, not about any
+   particular prompt. */
+const PREF_KEY = "mmh3.editorPrefs";
+const PREF_DEFAULTS = {
+  closeOnBackdrop: true, warnUnsaved: true,
+  // Closing writes the prompt to the node instead of asking about it. Off by
+  // default: the node holding something you didn't deliberately put there is
+  // a bigger surprise than being asked.
+  saveOnClose: false,
+  // Window and text scale, 100%-300%. A 4K monitor makes the default window
+  // small; these are per user, so they follow you into every workflow.
+  windowScale: 1.0, textScale: 1.0,
+  // Chips can be switched off for a plain text field. The mirror still
+  // renders (invisibly), so hover previews keep working.
+  highlightTags: true,
+  // The character before a subject's name that makes it shorthand (!Bob).
+  namePrefix: "!",
+};
+const SCALE_MIN = 1.0;
+const SCALE_MAX = 3.0;          // window
+const TEXT_SCALE_MAX = 2.0;     // type gets unwieldy past this
+
+function clampScale(v, max = SCALE_MAX) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return 1.0;
+  return Math.min(max, Math.max(SCALE_MIN, Math.round(n * 100) / 100));
+}
+
+function loadPrefs() {
+  try {
+    const v = { ...PREF_DEFAULTS,
+      ...JSON.parse(localStorage.getItem(PREF_KEY) || "{}") };
+    v.windowScale = clampScale(v.windowScale);
+    v.textScale = clampScale(v.textScale, TEXT_SCALE_MAX);
+    if (!NAME_PREFIXES.includes(v.namePrefix)) v.namePrefix = "!";
+    return v;
+  } catch (e) {
+    return { ...PREF_DEFAULTS };
+  }
+}
+
+function savePrefs(prefs) {
+  try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); }
+  catch (e) { /* private mode: the session's choice still applies */ }
+}
+// Apply the saved name prefix as soon as the script loads, so a prompt
+// generated before any editor opens uses it too.
+setNamePrefix(loadPrefs().namePrefix);
+
+/** Turn a failed request into something actionable.
+ *
+ *  ComfyUI answers unknown POST paths with 405 rather than 404, because its
+ *  catch-all frontend route matches the path but only for GET. In practice
+ *  that always means the Python side hasn't been reloaded. */
+function routeError(resp, fallback) {
+  if (resp && (resp.status === 405 || resp.status === 404)) {
+    return "ComfyUI hasn't loaded this feature's routes yet \u2014 restart " +
+           "ComfyUI (a browser refresh isn't enough) and try again.";
+  }
+  return fallback || `request failed (${resp?.status})`;
+}
+
+/** Copy text, working outside a secure context.
+ *
+ *  navigator.clipboard only exists on https or localhost. ComfyUI started
+ *  with --listen is usually reached over plain http at a LAN address, where
+ *  the API is simply absent — the old call short-circuited on `?.` and then
+ *  threw on `.then`, so copying failed silently. execCommand is deprecated
+ *  but still the only thing that works there. */
+async function copyText(text) {
+  try {
+    if (window.isSecureContext && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) {
+    /* fall through to the textarea route */
+  }
+  try {
+    const holder = document.createElement("textarea");
+    holder.value = text;
+    holder.setAttribute("readonly", "");
+    Object.assign(holder.style, {
+      position: "fixed", top: "0", left: "-9999px", opacity: "0",
+    });
+    document.body.append(holder);
+    const prev = document.activeElement;
+    holder.select();
+    holder.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    holder.remove();
+    try { prev?.focus?.(); } catch (e) { /* focus is best effort */ }
+    return ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+function el(tag, props = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props)) {
+    if (k === "style" && typeof v === "object") Object.assign(e.style, v);
+    else if (k === "class") e.className = v;
+    else if (k === "dataset") Object.assign(e.dataset, v);
+    else if (k.startsWith("on") && typeof v === "function")
+      e.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (k in e) {
+      // Some DOM properties are read-only (input.list, input.form, ...);
+      // assigning throws in strict mode, so fall back to the attribute.
+      try { e[k] = v; } catch (err) { e.setAttribute(k, v); }
+    }
+    else e.setAttribute(k, v);
+  }
+  for (const c of children.flat(Infinity)) {
+    if (c == null) continue;
+    e.append(c.nodeType ? c : document.createTextNode(c));
+  }
+  return e;
+}
+
+/** Kind icons as inline SVG.
+ *
+ *  Not glyphs: ▦ ▶ ♪ depend on whatever font the browser resolves for
+ *  system-ui, and on Linux that chain frequently has no coverage for the
+ *  Geometric Shapes block — the icons simply vanish or become tofu. SVG
+ *  renders identically everywhere, scales with font-size through the `em`
+ *  sizing, and takes its colour from currentColor. */
+const KIND_SVG = {
+  picture:
+    '<rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.4"/>' +
+    '<circle cx="5.5" cy="6" r="1.3" fill="currentColor"/>' +
+    '<path d="M3 12l3.2-3.6 2.3 2.4 2.1-2.3L13 12z" fill="currentColor"/>',
+  video:
+    '<rect x="1.5" y="2.5" width="13" height="11" rx="1.5" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.4"/>' +
+    '<path d="M6.3 5.6l4.5 2.4-4.5 2.4z" fill="currentColor"/>',
+  audio:
+    '<path d="M2 9.5V6.5M5 11.5v-7M8 13V3M11 11.5v-7M14 9.5V6.5" ' +
+    'fill="none" stroke="currentColor" stroke-width="1.5" ' +
+    'stroke-linecap="round"/>',
+};
+
+function kindIcon(kind) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 16 16");
+  svg.setAttribute("class", "mmh3-kindicon");
+  svg.setAttribute("aria-hidden", "true");
+  svg.innerHTML = KIND_SVG[kind] || "";
+  return svg;
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/* ------------------------------------------------------------------ */
+/* Duration snapping: H3 length grid is 17k+5 frames @ 24fps           */
+/* ------------------------------------------------------------------ */
+
+function snapLength(seconds) {
+  let L = Math.max(5, Math.round((Number(seconds) || 0) * 24));
+  L += (5 - (L % 17) + 17) % 17;
+  return L;
+}
+function snappedSeconds(seconds) {
+  return snapLength(seconds) / 24;
+}
+function fmtSS(seconds) {
+  return (Math.round(seconds * 100) / 100).toFixed(2);
+}
+
+/* Seconds → strict guide format MM:SS.mmm */
+function fmtTimestamp(sec) {
+  let mm = Math.floor(sec / 60);
+  let rest = sec - mm * 60;
+  let ss = Math.floor(rest);
+  let mmm = Math.round((rest - ss) * 1000);
+  if (mmm === 1000) { mmm = 0; ss += 1; }
+  if (ss === 60) { ss = 0; mm += 1; }
+  return `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}.` +
+    String(mmm).padStart(3, "0");
+}
+
+/* Smallest 17k+5 length strictly longer than a cut at `sec`. */
+function minLengthAfter(sec) {
+  let L = snapLength(sec);
+  if (L <= Math.round(sec * 24)) L += 17;
+  return L;
+}
+
+/* ------------------------------------------------------------------ */
+/* Default editor state                                                */
+/* ------------------------------------------------------------------ */
+
+function defaultState() {
+  return {
+    version: 1,
+    mode: "T2VA",
+    // Sections switched off: kept in the editor, left out of the prompt.
+    off: {},
+    duration: 5,
+    p2Shot: 1,       // FL2VA: shot index of Picture 2
+    lastShot: 1,     // L2VA: shot index of Picture 1 (final shot)
+    imd: "",
+    soundscape: "",
+    music: "N/A",
+    ref: {
+      subjectDefs: [],           // [{ text }]
+      summaryTypes: ["reference generation"],
+      summaryText: "",
+      retention: [],             // [{ label, context, marker, note }]
+      styleLine: "",
+      detail: "",
+      soundscape: "",
+      music: "N/A",
+    },
+  };
+}
+
+/** Merge a stored state over the current defaults.
+ *
+ *  Every state that comes from outside this session must pass through here,
+ *  not just the node's widget: a state missing a field the renderer reads
+ *  throws mid-render, which aborts the form build and leaves a half-drawn
+ *  panel — no chips, no rail, and no error the user can see. Drafts come
+ *  from disk and are exactly that kind of outside state. */
+function normaliseState(s) {
+  if (!s || !s.version) return defaultState();
+  const d = defaultState();
+  return { ...d, ...s, ref: { ...d.ref, ...(s.ref || {}) } };
+}
+
+function loadState(node) {
+  const w = node.widgets?.find((w) => w.name === "builder_state");
+  try {
+    return normaliseState(JSON.parse(w?.value || "{}"));
+  } catch (e) { /* fall through */ }
+  return defaultState();
+}
+
+/* ------------------------------------------------------------------ */
+/* Connected reference slots → tag chips with live previews            */
+/* ------------------------------------------------------------------ */
+
+function parseAnnotatedPath(v) {
+  let type = "input";
+  let name = String(v || "");
+  const m = name.match(/^(.*)\s\[(input|output|temp)\]$/);
+  if (m) { name = m[1]; type = m[2]; }
+  let subfolder = "";
+  const slash = name.lastIndexOf("/");
+  if (slash >= 0) { subfolder = name.slice(0, slash); name = name.slice(slash + 1); }
+  return { name, subfolder, type };
+}
+
+function viewURL(v) {
+  const { name, subfolder, type } = parseAnnotatedPath(v);
+  return api.apiURL(
+    `/view?filename=${encodeURIComponent(name)}` +
+    `&subfolder=${encodeURIComponent(subfolder)}&type=${type}`
+  );
+}
+
+function widgetValue(n, names) {
+  if (!n?.widgets) return null;
+  for (const name of names) {
+    const w = n.widgets.find((w) => w.name === name);
+    if (w && typeof w.value === "string" && w.value) return w.value;
+  }
+  return null;
+}
+
+/** Connected reference slots, with the tag numbers H3 will actually assign.
+ *
+ * Native ref2va presentation order (comfy_extras/nodes_minimax_h3.py):
+ *   images, then videos — each video's paired soundtrack emitting its
+ *   <Audio j> immediately BEFORE its <Video k> — then standalone audio.
+ * Ordinals are 1-based per type and follow connection order, not slot
+ * index, so gaps in the slots close up.
+ */
+function slotsFromItems(rawItems, sourceLabel) {
+  // Pure half of slotsFromBundle: compute the slots from an items array,
+  // regardless of where it came from — the live loader widget or a draft's
+  // stored media snapshot. Tag numbering must match nodes.py exactly either
+  // way, which is why draft mode goes through the same code.
+  if (!Array.isArray(rawItems)) return null;
+  const items = rawItems.filter(isOn);   // switched-off media never reaches the model
+
+  const { tags, extra } = computeTags(items);
+  const out = [];
+  const push = (tag, kind, item, note, previewKind) => {
+    const n = +(tag.match(/(\d+)>/) || [])[1];
+    out.push({
+      tag, kind, idx: n, cls: TAG_CLASS[kind], note, edit: !!item.edit, name: item.name, item,
+      slotName: `loader:${item.name}`,
+      source: `${sourceLabel} \u2022 ${item.name}`,
+      preview: { type: previewKind, url: loaderViewURL(item.file) },
+    });
+  };
+  items.filter((i) => i.kind === "picture")
+    .forEach((i) => push(tags.get(i), "Picture", i, null, "img"));
+  items.filter((i) => i.kind === "video").forEach((i) => {
+    if (extra.has(i) && (i.audio_mode || "paired") === "paired")
+      push(extra.get(i), "Audio", i,
+        `soundtrack of ${tags.get(i)}`, "audio");
+    push(tags.get(i), "Video", i, null, "video");
+  });
+  items.forEach((i) => {
+    if (i.kind === "audio") push(tags.get(i), "Audio", i, "standalone", "audio");
+    else if (i.kind === "video" && i.audio_mode === "standalone" && extra.has(i))
+      push(extra.get(i), "Audio", i, "split from " + tags.get(i), "audio");
+  });
+  out.bundled = true;
+  return out;
+}
+
+function loaderItems(node) {
+  // The connected loader's raw items array, or null if none is wired.
+  const idx = (node.inputs || []).findIndex((i) => i.name === "references");
+  if (idx < 0 || node.inputs[idx].link == null) return null;
+  const loader = originNode(node, idx);
+  if (!loader || loader.type !== LOADER_NAME) return null;
+  try {
+    const items = JSON.parse(
+      loader.widgets?.find((w) => w.name === "media_state")?.value || "[]");
+    return Array.isArray(items) ? items : null;
+  } catch (e) { return null; }
+}
+
+function slotsFromBundle(node) {
+  // The Media Loader keeps its inventory in a widget, so the tags it will
+  // produce can be read straight off the graph without a round trip.
+  const items = loaderItems(node);
+  if (!items) return null;
+  return slotsFromItems(items, "Media Loader");
+}
+
+/** Walk a mods chain upstream from `head`. RefMod Stacks are collected in
+ *  bundle order; Prompt Builders are stepped through (their mods output is
+ *  the bundle they were given). Anything else heads the chain with entries
+ *  we cannot see, so the result is marked partial. */
+function modsChain(head) {
+  const chain = [];
+  let partial = false, n = head, guard = 0;
+  while (n && guard++ < 32) {
+    if (n.type !== STACK_NAME && n.type !== NODE_NAME) { partial = true; break; }
+    if (n.type === STACK_NAME) chain.unshift(n);
+    const up = (n.inputs || []).findIndex((i) => i.name === "mods");
+    if (up < 0 || n.inputs[up].link == null) break;
+    n = originNode(n, up);
+  }
+  return { chain, partial };
+}
+
+/** Where this builder's RefMods come from: its own mods input when that is
+ *  wired, otherwise the mods input of a RefMod Text Encode its prompt feeds
+ *  (the older wiring, still honoured). */
+function refmodSource(node) {
+  const own = (node.inputs || []).findIndex((i) => i.name === "mods");
+  if (own >= 0 && node.inputs[own].link != null)
+    return { head: originNode(node, own), direct: true };
+  const enc = outputTargets(node, 0).find((n) => ENCODE_NAMES.has(n?.type));
+  if (!enc) return { head: null, why: "encode" };
+  const mi = (enc.inputs || []).findIndex((i) => i.name === "mods");
+  if (mi < 0 || enc.inputs[mi].link == null) return { head: null, why: "mods" };
+  return { head: originNode(enc, mi), direct: false };
+}
+
+/** True when this builder's RefMods reach a Text Encode: its mods output is
+ *  wired somewhere, or a Text Encode its prompt feeds has mods of its own. */
+function refmodsReachEncode(node) {
+  const out = (node.outputs || []).findIndex((o) => o.name === "mods");
+  if (out >= 0 && outputTargets(node, out).length) return true;
+  return outputTargets(node, 0).some((enc) => ENCODE_NAMES.has(enc?.type) &&
+    (enc.inputs || []).some((i) => i.name === "mods" && i.link != null));
+}
+
+/** The RefMod Text Encodes this builder drives, through its prompt or mods output. */
+function encodersOf(node) {
+  const seen = new Set(), out = [];
+  const modsOut = (node.outputs || []).findIndex((o) => o.name === "mods");
+  for (const slot of modsOut >= 0 ? [0, modsOut] : [0]) {
+    for (const n of outputTargets(node, slot)) {
+      if (ENCODE_NAMES.has(n?.type) && !seen.has(n)) { seen.add(n); out.push(n); }
+    }
+  }
+  return out;
+}
+
+/** Where the Text Encode's media comes from: "builder" (this node's
+ *  references output), "loader" (the same Media Loader, wired straight in),
+ *  "other" (a source this builder can't see), or null (no media sent). */
+function mediaReach(node) {
+  const refIn = (node.inputs || []).findIndex((i) => i.name === "references");
+  const loader = refIn >= 0 && node.inputs[refIn].link != null ? originNode(node, refIn) : null;
+  let found = null;
+  for (const enc of encodersOf(node)) {
+    const ri = (enc.inputs || []).findIndex((i) => i.name === "references");
+    if (ri < 0 || enc.inputs[ri].link == null) continue;
+    const src = originNode(enc, ri);
+    if (src === node) return "builder";
+    if (loader && src === loader) return "loader";
+    found = found || "other";
+  }
+  return found;
+}
+
+/** The mode the node's Python side gates media by: the saved mode, or REF
+ *  (everything passes) when nothing has been saved yet — nodes.py's rule,
+ *  which differs from the editor's own T2VA starting point. */
+function gateMode(node) {
+  try {
+    const mode = JSON.parse(node.widgets?.find((w) => w.name === "builder_state")?.value || "{}").mode;
+    return MODE_CAPACITY[mode] ? mode : "REF";
+  } catch (e) { return "REF"; }
+}
+
+/** Media slots as the builder's own outputs would carry them: everything a
+ *  connected Media Loader holds, else what is wired to the picture_/video_/
+ *  audio_ inputs. */
+function mediaSlots(node) {
+  return slotsFromBundle(node) || directSlots(node);
+}
+
+/** Reference slots when this prompt uses RefMods.
+ *
+ * RefMod Text Encode (ours or ComfyUI-MiniMaxH3Mod's) labels its bundle
+ * itself: one counter per kind, in bundle order, every copy numbered. Find
+ * the stacks (see refmodSource) and reproduce that numbering. A non-stack
+ * loader at the head of the chain contributes entries we cannot see, so the
+ * result is marked partial and the numbers are best-effort.
+ */
+function refmodSlots(node, opts = {}) {
+  const src = refmodSource(node);
+  if (!src.head) return null;
+  const { chain, partial } = modsChain(src.head);
+  if (!chain.length) return null;
+  // A draft can stand in for what the nearest stack holds (its own picks, or
+  // the ones frozen when it started) and for the loader's media.
+  const nearest = chain[chain.length - 1];
+  // A pick's saved uid only counts within its own stack node: a pasted node
+  // keeps its copy's numbers, so two stacks in a chain can hold the same
+  // uid, and the draft would then fold one RefMod's look and voice into
+  // another's. Key each pick by node and position instead.
+  const picksOf = (st) => (st === nearest && opts.picks ? opts.picks : readStack(st).picks)
+    .map((p, i) => (p && typeof p === "object" ? { ...p, uid: `${st.id}:${i}` } : p));
+  const sourceLabel = opts.picks ? (opts.picksLabel || "Draft RefMods") : "RefMod Stack";
+  const media = opts.media ? slotsFromItems(opts.media, opts.mediaLabel || "Media Loader") : mediaSlots(node);
+
+  // Loader media the Text Encode also receives is labelled first, one
+  // counter per kind — the RefMods' numbers move up behind it.
+  const reach = mediaReach(node);
+  const out = [];
+  const offset = { Picture: 0, Video: 0, Audio: 0 };
+  if (reach === "builder" || reach === "loader") {
+    const cap = reach === "builder" ? MODE_CAPACITY[gateMode(node)] : MODE_CAPACITY.REF;
+    for (const m of media || []) {
+      // The builder withholds what its mode doesn't use; a loader wired
+      // straight in sends everything. Orphan soundtracks reach neither.
+      if (!m.tag || m.idx > (cap[m.kind] ?? 0)) continue;
+      out.push(m);
+      offset[m.kind] = Math.max(offset[m.kind], m.idx);
+    }
+  }
+  const allPicks = chain.flatMap((st) => picksOf(st));
+  const pickByUid = new Map(allPicks.map((p) => [p.uid, p]));
+  const groups = labelGroups(chain.flatMap((st) => deriveEntries(picksOf(st))));
+  const copyTags = new Set();
+  const firstRefmod = out.length;
+  for (const g of groups) {
+    if (!g.nums.length) continue;
+    const kind = REFMOD_KIND[g.kind].label;
+    g.nums = g.nums.map((num) => num + offset[kind]);
+    const tags = g.nums.map((num) => `<${kind} ${num}>`);
+    tags.slice(1).forEach((t) => copyTags.add(t));
+    out.push({
+      tag: tags[0], kind, idx: g.nums[0], cls: TAG_CLASS[kind],
+      note: g.key === "audio" ? "voice" : null,
+      copies: tags.slice(1), range: refmodRange(g),
+      slotName: `refmod:${g.file}`,
+      source: `${sourceLabel} \u2022 ${g.name}`,
+      preview: g.preview ? { type: "img", url: refmodPreviewURL(g.preview) } : null,
+      refmod: { uid: g.uid, name: g.name, role: g.key === "audio" ? "voice" : "look",
+        weight: weightText(pickByUid.get(g.uid)?.[g.key]), tokens: g.tokens * g.nums.length,
+        draft: !!opts.picks },
+    });
+  }
+  // A RefMod's look and voice name each other in the hover card.
+  for (const sl of out.slice(firstRefmod)) {
+    const other = out.slice(firstRefmod).find((o) => o !== sl && o.refmod.uid === sl.refmod.uid);
+    if (other) sl.refmod.pair = { role: other.refmod.role, tag: other.tag };
+  }
+  out.refmod = true;
+  out.partial = partial || reach === "other";
+  out.copyTags = copyTags;
+  out.unsent = !!src.direct && !refmodsReachEncode(node);
+  out.media = reach;
+  out.mediaUnsent = !reach && (media || []).some((m) => m.tag);
+  return out;
+}
+
+/** A stack channel's weight the way its row shows it. */
+function weightText(ch) {
+  if (!ch) return "";
+  if (ch.mode === "sc") return `strength ${Number(ch.s ?? 1).toFixed(2)} \u00d7 ${ch.c ?? 1}`;
+  return `weight ${Number(ch.w ?? 1).toFixed(2).replace(/\.?0+$/, "")}`;
+}
+
+/** The RefMod Stack this prompt's references come from (the one nearest the
+ *  builder), or null with a reason: "encode", "mods" or "other". */
+function refmodStackFor(node) {
+  const src = refmodSource(node);
+  if (!src.head) return { stack: null, why: src.why };
+  const { chain } = modsChain(src.head);
+  return chain.length ? { stack: chain[chain.length - 1] } : { stack: null, why: "other" };
+}
+
+function getRefSlots(node, opts = {}) {
+  const viaRefmod = refmodSlots(node, opts);
+  if (viaRefmod) return viaRefmod;
+  if (opts.media) return slotsFromItems(opts.media, opts.mediaLabel || "Media Loader");
+  const bundled = slotsFromBundle(node);
+  if (bundled) return bundled;
+  return directSlots(node);
+}
+
+/** What our RefMod Text Encode will present, in the order the model reads
+ *  it: the media on its references input (a Media Loader, or a Prompt Builder
+ *  passing media on through its mode's gate), then the RefMods on its mods
+ *  input in bundle order, each kind numbered on from the media. A source this
+ *  can't see into makes the list partial; `withheld` counts media the
+ *  builder's mode keeps back. */
+function encodeSlots(enc) {
+  const from = (name) => {
+    const i = (enc.inputs || []).findIndex((x) => x.name === name);
+    return i >= 0 && enc.inputs[i].link != null ? originNode(enc, i) : null;
+  };
+  const refSrc = from("references"), modSrc = from("mods");
+  let media = [], all = [], withheld = 0, partial = false;
+  if (refSrc?.type === LOADER_NAME) {
+    let items = [];
+    try { items = JSON.parse(refSrc.widgets?.find((w) => w.name === "media_state")?.value || "[]"); } catch (e) { items = []; }
+    media = all = slotsFromItems(Array.isArray(items) ? items : [], "Media Loader") || [];
+  } else if (refSrc?.type === NODE_NAME) {
+    all = (mediaSlots(refSrc) || []).filter((m) => m.tag);
+    const cap = MODE_CAPACITY[gateMode(refSrc)];
+    media = all.filter((m) => m.idx <= (cap[m.kind] ?? 0));
+    withheld = all.length - media.length;
+  } else if (refSrc) partial = true;
+  // a clip's soundtrack is named after the clip, which is the next row
+  const rows = media.map((m) => ({ group: "Media", tag: m.tag, kind: m.kind, name: m.name || m.source,
+    more: m.kind === "Audio" && m.note && m.note !== "standalone" ? "soundtrack"
+      : m.edit && m.kind === "Video" ? "being edited" : m.name ? "" : m.slotName }));
+  // The thumbnails gather a source's rows on one card: a loader file with
+  // its soundtrack, a RefMod with its look and voice.
+  const cards = [], cardOf = new Map();
+  const onCard = (key, make, row) => {
+    let card = key != null && cardOf.get(key);
+    if (!card) { card = { ...make(), tags: [] }; cards.push(card); if (key != null) cardOf.set(key, card); }
+    card.tags.push(row);
+  };
+  media.forEach((m, i) => onCard(m.item, () => ({ group: "Media", name: rows[i].name, item: m.item, preview: m.preview }), rows[i]));
+  // reference_map's lines, as refmod_nodes.reference_lines writes them: a
+  // clip by its slot (a builder input's own number), the rest counted
+  const lines = [];
+  const slotOf = (m) => +((m.slotName || "").match(/^video(?:_audio)?_(\d+)$/) || [])[1] || 0;
+  let pics = 0, auds = 0;
+  for (const m of media) {
+    const what = m.kind === "Picture" ? `picture ${++pics}`
+      : m.kind === "Video" ? `video ${slotOf(m) || m.idx}`
+      : m.note?.startsWith("soundtrack of") ? `soundtrack of video ${slotOf(m) || +m.note.match(/(\d+)>$/)[1]}`
+      : `audio ${++auds}`;
+    lines.push(`${m.tag} = ${what} (media)`);
+  }
+  const offset = { Picture: 0, Video: 0, Audio: 0 };
+  for (const m of media) offset[m.kind] = Math.max(offset[m.kind], m.idx);
+  if (modSrc) {
+    const { chain, partial: unseen } = modsChain(modSrc);
+    partial = partial || unseen;
+    for (const g of labelGroups(chain.flatMap((st) => deriveEntries(readStack(st).picks)))) {
+      if (!g.nums.length) continue;
+      const kind = REFMOD_KIND[g.kind].label, nums = g.nums.map((num) => num + offset[kind]);
+      const row = { group: "RefMods", kind, name: g.name,
+        tag: nums.length > 1 ? `<${kind} ${nums[0]}\u2013${nums[nums.length - 1]}>` : `<${kind} ${nums[0]}>`,
+        more: nums.length > 1 ? `${nums.length} copies` : "" };
+      rows.push(row);
+      for (const num of nums) lines.push(`<${kind} ${num}> = ${String(g.name).split("/").pop()}`);
+      onCard(g.uid, () => ({ group: "RefMods", name: g.name, refmod: true, preview: g.preview }),
+        { ...row, tokens: g.tokens * nums.length });
+    }
+  }
+  const edited = all.find((m) => m.kind === "Video" && m.item?.edit && m.item?.mask);
+  if (edited) lines.push(`Editing ${edited.item.name} (masked area regenerated)`);
+  return { rows, cards, lines, partial, withheld, linked: !!(refSrc || modSrc) };
+}
+
+/** Slots from the picture_/video_/audio_ inputs, numbered as the native
+ *  Reference to Video node numbers them. */
+function directSlots(node) {
+  const group = (re) => {
+    const arr = [];
+    (node.inputs || []).forEach((inp, i) => {
+      const m = inp.name?.match(re);
+      if (m && inp.link != null) arr.push({ idx: +m[1], input: i });
+    });
+    return arr.sort((a, b) => a.idx - b.idx);
+  };
+  const pics = group(/^picture_(\d+)$/);
+  const vids = group(/^video_(\d+)$/);
+  const vauds = group(/^video_audio_(\d+)$/);
+  const auds = group(/^audio_(\d+)$/);
+
+  const mk = (kind, num, g, slotName, note) => {
+    const origin = originNode(node, g.input);
+    let preview = null;
+    if (origin) {
+      const t = (origin.type || "").toLowerCase();
+      if (kind === "Picture") {
+        const v = widgetValue(origin, ["image", "file"]);
+        if (v) preview = { type: "img", url: viewURL(v) };
+      } else if (kind === "Video") {
+        const v = widgetValue(origin, ["file", "video"]);
+        if (v && (t.includes("video") || t.includes("vhs")))
+          preview = { type: "video", url: viewURL(v) };
+      } else {
+        const v = widgetValue(origin, ["audio", "file"]);
+        if (v) preview = { type: "audio", url: viewURL(v) };
+      }
+    }
+    return {
+      tag: `<${kind} ${num}>`, kind, idx: num, slotName, note,
+      cls: TAG_CLASS[kind], preview,
+      source: origin?.title || origin?.type || "connected",
+    };
+  };
+
+  const out = [];
+  pics.forEach((g, i) => out.push(mk("Picture", i + 1, g, `picture_${g.idx}`)));
+
+  let audioN = 0;
+  const pending = [];
+  vids.forEach((g, i) => {
+    const vNum = i + 1;
+    // A soundtrack pairs with the same-numbered video slot and is labelled first.
+    const track = vauds.find((a) => a.idx === g.idx);
+    if (track) {
+      audioN += 1;
+      pending.push(mk("Audio", audioN, track, `video_audio_${track.idx}`,
+        `soundtrack of <Video ${vNum}>`));
+    }
+    pending.push(mk("Video", vNum, g, `video_${g.idx}`));
+  });
+  out.push(...pending);
+
+  auds.forEach((g) => {
+    audioN += 1;
+    out.push(mk("Audio", audioN, g, `audio_${g.idx}`, "standalone"));
+  });
+
+  // Soundtracks wired without their video never reach the model.
+  vauds.forEach((a) => {
+    if (!vids.some((v) => v.idx === a.idx))
+      out.push({ tag: null, kind: "Audio", idx: null,
+        slotName: `video_audio_${a.idx}`, orphan: a.idx, cls: "aud",
+        preview: null, source: "" });
+  });
+
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* Prompt generation (formats verbatim from the guides)                */
+/* ------------------------------------------------------------------ */
+
+/** Sections the model tolerates being absent. The description and summary
+ *  always ship — without them there is no prompt. */
+const OPTIONAL_SECTIONS = ["subject_definitions", "retention_analysis",
+                           "overall_soundscape", "non_diegetic_music"];
+
+function sectionOn(state, name) {
+  return !(state.off && state.off[name]);
+}
+
+function genBase(state) {
+  const S = fmtSS(snappedSeconds(state.duration));
+  let head = "";
+  if (state.mode === "I2VA") {
+    head = "For the target video, at 0.00 seconds into the target video, " +
+      "<Picture 1> (from [Shot 1]) is fully referenced.";
+  } else if (state.mode === "FL2VA") {
+    head = "How the reference pictures align with the target video — " +
+      "Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; " +
+      `Picture 2 (from Shot ${state.p2Shot || 1}) aligns with the ${S}-second mark of the target video.`;
+  } else if (state.mode === "L2VA") {
+    head = "How the reference pictures align with the target video — " +
+      `<Picture 1> (from [Shot ${state.lastShot || 1}]) aligns with the ${S}-second mark of the target video.`;
+  }
+  const parts = [`integrated_multimodal_description: ${state.imd.trim()}`];
+  if (sectionOn(state, "overall_soundscape"))
+    parts.push(`overall_soundscape: ${state.soundscape.trim()}`);
+  if (sectionOn(state, "non_diegetic_music"))
+    parts.push(`non_diegetic_music: ${state.music.trim() || "N/A"}`);
+  const body = parts.join("\n\n");
+  return head ? head + "\n\n" + body : body;
+}
+
+function genRef(state) {
+  const r = state.ref;
+  const names = subjectNames(state);
+  const ex = (t) => expandNames(t, names);
+  const defs = r.subjectDefs
+    .filter((d) => !d.off)
+    .map((d) => {
+      let line = d.text.trim();
+      const name = (d.name || "").trim();
+      // The name rides on the definition so the model ties it to the label.
+      if (line && name && /^<Subject \d+>/.test(line))
+        line = line.replace(/\.?\s*$/, "") + `. Their name is ${name}.`;
+      // A voice line says whose voice it is when its subject has a name, and
+      // its description rides along, after the drafted wording.
+      const bind = voiceBinding(line);
+      const owner = bind?.subj && Object.values(names).find((n) => n.tag === bind.subj);
+      const voice = oneLine(d.voice);
+      if (line && bind && (owner || voice))
+        line = line.replace(/\.?\s*$/, "") + (owner
+          ? `. It is ${owner.name}'s voice${voice ? `: ${voice}` : ""}.`
+          : `. It is ${withArticle(voice)}.`);
+      return line;
+    }).filter(Boolean).join("\n");
+  const types = TASK_TYPES.filter((t) => r.summaryTypes.includes(t)).join(" + ");
+  const summary = `[${types || "reference generation"}] ${ex(r.summaryText.trim())}`;
+  const retention = r.retention
+    .filter((row) => row.label && !row.off)
+    .map((row) => {
+      const ctx = row.context?.trim() ? ` (${row.context.trim()})` : "";
+      return `${row.label}${ctx}: ${row.marker} - ${ex(row.note.trim())}`;
+    })
+    .join("\n");
+  const detail = [ex(r.styleLine.trim()), ex(r.detail.trim())].filter(Boolean).join("\n");
+  const on = (name) => sectionOn(state, name);
+  const blocks = [];
+  if (on("subject_definitions"))
+    blocks.push(`subject_definitions:\n${defs}`);
+  blocks.push(`summary:\n${summary}`);
+  if (on("retention_analysis"))
+    blocks.push(`retention_analysis:\n${retention}`);
+  blocks.push(`detailed_description:\n${detail}`);
+  if (on("overall_soundscape"))
+    blocks.push(`overall_soundscape:\n${ex(r.soundscape.trim())}`);
+  if (on("non_diegetic_music"))
+    blocks.push(`non_diegetic_music:\n${ex(r.music.trim()) || "N/A"}`);
+  return blocks.join("\n\n");
+}
+
+function generate(state) {
+  return state.mode === "REF" ? genRef(state) : genBase(state);
+}
+
+/* ------------------------------------------------------------------ */
+/* Validation                                                          */
+/* ------------------------------------------------------------------ */
+
+function tsToMs(mm, ss, mmm) {
+  return (parseInt(mm, 10) * 60 + parseInt(ss, 10)) * 1000 + parseInt(mmm, 10);
+}
+
+function validate(state, slots) {
+  const issues = [];
+  const err = (m) => issues.push({ level: "error", msg: m });
+  const warn = (m) => issues.push({ level: "warn", msg: m });
+  const info = (m) => issues.push({ level: "info", msg: m });
+
+  /* --- connected inputs vs. what this mode can use ------------------ */
+  const cap = MODE_CAPACITY[state.mode];
+  const orphans = slots.filter((s) => s.orphan != null);
+  const live = slots.filter((s) => s.tag);
+  const byKind = { Picture: [], Video: [], Audio: [] };
+  live.forEach((s) => byKind[s.kind]?.push(s));
+  const slotName = (s) => s.slotName;
+
+  orphans.forEach((s) => {
+    err(
+      `${s.slotName} is connected but video_${s.orphan} is not — a soundtrack ` +
+      "only reaches the model paired with its same-numbered video, so this " +
+      "audio is dropped and gets no <Audio> tag."
+    );
+  });
+
+  if (slots.refmod) {
+    // The prompt feeds H3 RefMod Text Encode, which labels whatever the
+    // stack sends regardless of mode — none of the per-mode capacity rules
+    // below apply. What matters is that the numbers line up.
+    if (slots.unsent)
+      warn("RefMods are wired into this node, but its mods output isn't connected " +
+        "to RefMod Text Encode \u2014 wire mods into the Text Encode's mods input, " +
+        "or the model won't see them.");
+    if (slots.mediaUnsent)
+      warn("This node's media isn't sent to RefMod Text Encode \u2014 wire its " +
+        "references output into the Text Encode's references input, or the model " +
+        "won't see those pictures and clips.");
+    if (slots.media === "other")
+      info("The Text Encode's references input comes from somewhere this node can't " +
+        "see, so its media is numbered first and the labels shown here may be shifted.");
+    else if (slots.partial)
+      info("A loader that isn't a RefMod Stack heads this chain, so its entries " +
+        "are numbered first and the labels shown here may be shifted.");
+  } else if (state.mode === "REF") {
+    const total = live.length;
+    if (cap.total && total > cap.total) {
+      err(
+        `${total} reference files are connected — the documented limit is ` +
+        `${cap.total}. Disconnect ${total - cap.total} yourself: the node will ` +
+        "not guess which to drop, and the tag numbering depends on what stays wired."
+      );
+    }
+    if (!total)
+      info(slots.bundled
+        ? "The Media Loader is connected but empty."
+        : "No reference media is mirrored on this node yet. Use '+ Media loader' " +
+          "for a single-cable setup.");
+  } else {
+    // Base modes: pictures are keyframes, and there are no video/audio slots.
+    const used = byKind.Picture.filter((s) => s.idx <= cap.Picture);
+    const extraPics = byKind.Picture.filter((s) => s.idx > cap.Picture);
+    const roleList = Object.entries(cap.roles)
+      .map(([tag, role]) => `<${tag}> (${role})`).join(" and ");
+
+    if (cap.Picture === 0 && byKind.Picture.length) {
+      warn(
+        `${state.mode} takes no reference image — ` +
+        `${byKind.Picture.map(slotName).join(", ")} will be ignored.`
+      );
+    } else if (extraPics.length) {
+      warn(
+        `${state.mode} uses ${cap.Picture === 1 ? "one reference image" : "two reference images"}: ` +
+        `${roleList}. ${extraPics.map(slotName).join(", ")} ` +
+        `${extraPics.length > 1 ? "are" : "is"} connected but will be ignored.`
+      );
+    } else if (used.length && cap.Picture) {
+      info(`${state.mode} uses ${roleList}.`);
+    }
+
+    const av = [...byKind.Video, ...byKind.Audio];
+    if (av.length) {
+      warn(
+        `${state.mode} has no reference video or audio slots — ` +
+        `${av.map(slotName).join(", ")} ` +
+        `${av.length > 1 ? "are" : "is"} connected but will be ignored. ` +
+        "Switch to Reference mode to use them."
+      );
+    }
+  }
+
+  const body = state.mode === "REF"
+    ? [state.ref.styleLine, state.ref.detail].join("\n")
+    : state.imd;
+  const full = generate(state);
+
+  // Shot structure
+  if (!/\[Shot 1\]/.test(body)) warn("Body has no [Shot 1] opening.");
+  if (/\[Shot 1\]\s*At \d{2}:\d{2}\.\d{3}/.test(body))
+    warn("[Shot 1] must not carry a timestamp (guide §4.2).");
+  const stamps = [...body.matchAll(/\[Shot (\d+)\](?:\s*At (\d{2}):(\d{2})\.(\d{3}))?/g)];
+  let lastMs = -1, lastShot = 0;
+  const hasDuration = state.mode === "FL2VA" || state.mode === "L2VA";
+  const durMs = snappedSeconds(state.duration) * 1000;
+  for (const m of stamps) {
+    const n = parseInt(m[1], 10);
+    if (n !== lastShot + 1) warn(`Shot numbering jumps from ${lastShot} to ${n}.`);
+    lastShot = n;
+    if (n > 1) {
+      if (!m[2]) warn(`[Shot ${n}] is missing its "At MM:SS.mmm," cut time.`);
+      else {
+        const ms = tsToMs(m[2], m[3], m[4]);
+        if (ms <= lastMs) warn(`[Shot ${n}] cut time is not strictly increasing.`);
+        if (hasDuration && ms >= durMs)
+          warn(`[Shot ${n}] cut time exceeds the ${fmtSS(durMs / 1000)}s end time.`);
+        lastMs = ms;
+      }
+    }
+  }
+  if (state.mode === "FL2VA" && lastShot > 1)
+    info("FL2VA generally favors a single shot for clean interpolation (guide §3.2).");
+
+  // Dialogue blocks
+  const dOpen = (body.match(/<d>/g) || []).length;
+  const dClose = (body.match(/<\/d>/g) || []).length;
+  if (dOpen !== dClose) warn(`Unbalanced <d> tags (${dOpen} open / ${dClose} close).`);
+  for (const m of body.matchAll(/<d>(.*?)<\/d>/gs)) {
+    if (!/^\s*\[[A-Za-z]+\]/.test(m[1]))
+      warn(`A <d> block is missing its [Language] tag: "${m[1].slice(0, 32)}…"`);
+  }
+
+  // Reference tag cross-checks
+  const cited = new Set([...full.matchAll(/<(Picture|Video|Audio) (\d+)>/g)]
+    .map((m) => `<${m[1]} ${m[2]}>`));
+  const uncited = live.filter((s) => {
+    const usable = slots.refmod || state.mode === "REF" ||
+      (s.kind === "Picture" && s.idx <= cap.Picture);
+    return usable && !cited.has(s.tag);
+  }).map((s) => s.tag);
+  if (uncited.length === 1) {
+    warn(`${uncited[0]} is connected but never cited in the prompt.`);
+  } else if (uncited.length) {
+    warn(`${uncited.length} connected references are never cited in the prompt: ` +
+      uncited.join(", ") + ".");
+  }
+  const connected = new Set(live.map((s) => s.tag));
+  const copyTags = slots.copyTags || new Set();
+  for (const t of cited) {
+    const [, kind, num] = t.match(/<(\w+) (\d+)>/);
+    if (slots.refmod) {
+      if (copyTags.has(t)) {
+        const owner = live.find((s) => s.copies?.includes(t));
+        info(`${t} is a copy of ${owner?.tag || "another label"} (${owner?.source || "RefMod Stack"}); citing ${owner?.tag || "the first label"} is enough.`);
+      } else if (!connected.has(t)) {
+        if (slots.partial)
+          info(`${t} is cited but no RefMod Stack in the chain provides it — the upstream loader may.`);
+        else
+          warn(`${t} is cited but the RefMod Stack does not provide it. Check the stack's order and weights.`);
+      }
+    } else if (cap[kind] === 0) {
+      warn(`${t} is cited, but ${state.mode} has no ${kind.toLowerCase()} reference to bind it to.`);
+    } else if (+num > cap[kind]) {
+      warn(`${t} is cited, but ${state.mode} only uses ${kind} 1${cap[kind] > 1 ? `\u2013${cap[kind]}` : ""}.`);
+    } else if (!connected.has(t)) {
+      if (slots.bundled)
+        warn(`${t} is cited but the Media Loader does not provide it.`);
+      else
+        info(`${t} is cited but not mirrored on this node (fine if wired only to the native node).`);
+    }
+  }
+
+  if (state.mode === "REF") {
+    // Switched-off lines aren't in the prompt, so they don't count as
+    // defined and can't be missing a retention entry.
+    const liveDefs = state.ref.subjectDefs.filter((d) => !d.off);
+    const liveRet = state.ref.retention.filter((r) => !r.off);
+    const defText = liveDefs.map((d) => d.text).join("\n");
+    const subjects = new Set([...defText.matchAll(/<Subject (\d+)>/g)].map((m) => m[1]));
+    const retLabels = new Set(liveRet.map((r) => r.label));
+    for (const n of subjects) {
+      if (![...retLabels].some((l) => l === `<Subject ${n}>`))
+        warn(`<Subject ${n}> has no retention_analysis entry.`);
+    }
+    // !Name shorthand: every one used must belong to a named, switched-on subject.
+    const names = subjectNames(state);
+    const r = state.ref;
+    const used = new Set([...[r.summaryText, r.styleLine, r.detail, r.soundscape, r.music,
+      ...liveRet.map((x) => x.note)].join("\n").matchAll(NAME_TOKEN_RE)].map((m) => m[1]));
+    for (const nm of used) {
+      if (!lookupName(names, nm)) warn(`${NAME_PREFIX}${nm} is used, but no switched-on subject definition has the name "${nm}" \u2014 ` +
+        "give a subject that name, or write it out.");
+    }
+    liveDefs.forEach((d) => {
+      const nm = (d.name || "").trim();
+      if (nm && !/^[A-Za-z][\w-]*$/.test(nm))
+        warn(`Subject name "${nm}" can't be used as a ${NAME_PREFIX}tag \u2014 letters, digits, - and _ only, no spaces.`);
+      else if (nm && !/^<Subject \d+>/.test((d.text || "").trim()))
+        warn(`The name "${nm}" is on a line that doesn't start with <Subject N>, so it isn't used.`);
+    });
+    // The guide requires the marker to sit inside the role the definition
+    // already states, so a plain contradiction is worth flagging.
+    liveRet.forEach((row) => {
+      const def = definitionFor(state, row.label);
+      if (!def || !row.marker) return;
+      const copies = /\breused\b|\bcopied\b|\bcopy\b|1:1/i.test(def);
+      const refsOnly = /without copying|\breference\b|only its/i.test(def);
+      const copyMarker = ["fully_copy", "partially_copy"].includes(row.marker);
+      if (copies && !refsOnly && row.marker === "reference")
+        warn(`${row.label} is defined as reused or copied, but its retention ` +
+          "marker says reference \u2014 one of the two is wrong.");
+      if (refsOnly && !copies && copyMarker)
+        warn(`${row.label} is defined as a reference only, but its retention ` +
+          `marker says ${row.marker} \u2014 one of the two is wrong.`);
+    });
+
+    const wc = state.ref.detail.trim() ? state.ref.detail.trim().split(/\s+/).length : 0;
+    if (wc && (wc < 350 || wc > 500))
+      info(`detailed_description is ${wc} words (guide suggests 350–500 for generation tasks).`);
+    if (!state.ref.styleLine.trim())
+      info("No style opening before [Shot 1] (guide §5.2 expects 1–2 style sentences).");
+    if (!state.ref.summaryText.trim()) warn("summary text is empty.");
+  } else {
+    if ((state.mode === "I2VA" || state.mode === "FL2VA" || state.mode === "L2VA") &&
+        !/<?Picture 1>?/.test(full))
+      warn("Keyframe modes should anchor the description to Picture 1.");
+    if (!state.soundscape.trim())
+      warn("overall_soundscape is empty (use it unless the user wants total silence).");
+  }
+  return issues;
+}
+
+/* ------------------------------------------------------------------ */
+/* CSS                                                                 */
+/* ------------------------------------------------------------------ */
+
+const CSS = `
+.mmh3-overlay{position:fixed;inset:0;z-index:10000;background:rgba(8,10,14,.62);
+  display:flex;align-items:center;justify-content:center;font-family:system-ui,sans-serif;}
+.mmh3-modal{width:min(1240px,95vw);height:min(860px,92vh);display:flex;flex-direction:column;
+  background:#191c22;color:#d7dbe2;border:1px solid #303642;border-radius:10px;
+  box-shadow:0 24px 64px rgba(0,0,0,.55);overflow:hidden;}
+.mmh3-head{display:flex;align-items:center;gap:14px;padding:10px 16px;
+  border-bottom:1px solid #2a2f3a;background:#1e222a;}
+.mmh3-title{font-weight:600;font-size:calc(14px * var(--mmh3-fs, 1));letter-spacing:.02em;}
+.mmh3-title small{color:#8a93a3;font-weight:400;margin-left:8px;}
+.mmh3-modesends{padding:4px 14px;font-size:calc(10px * var(--mmh3-fs, 1));color:#7d8698;
+  background:#171a20;border-bottom:1px solid #23272f;}
+.mmh3-modesends.gated{color:#e0a94c;}
+.mmh3-modes{display:flex;gap:2px;background:#12151b;border:1px solid #2a2f3a;
+  border-radius:7px;padding:2px;margin-left:auto;}
+.mmh3-modes button{background:none;border:0;color:#9aa3b2;padding:5px 12px;border-radius:5px;
+  cursor:pointer;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-modes button.on{background:#2f3947;color:#fff;}
+.mmh3-x{background:none;border:0;color:#8a93a3;font-size:calc(18px * var(--mmh3-fs, 1));cursor:pointer;padding:2px 8px;}
+/* Close always sits at the far right, as every other window does. */
+.mmh3-head .mmh3-x{margin-left:auto;}
+.mmh3-x:hover{color:#fff;}
+.mmh3-body{flex:1;display:grid;grid-template-columns:minmax(0,1fr) 0 440px;min-height:0;
+  transition:grid-template-columns .16s ease;}
+.mmh3-body.haspins{grid-template-columns:minmax(0,1fr) 176px 400px;}
+@media (max-width:980px){.mmh3-body,.mmh3-body.haspins{grid-template-columns:1fr;}}
+.mmh3-pins{overflow:hidden auto;background:#15181e;border-left:1px solid #2a2f3a;
+  padding:0;display:flex;flex-direction:column;gap:6px;}
+.mmh3-body.haspins .mmh3-pins{padding:10px 8px;}
+.mmh3-pinhead{font-size:calc(10px * var(--mmh3-fs, 1));text-transform:uppercase;letter-spacing:.08em;color:#8a93a3;}
+.mmh3-pincard{border:1px solid #363d4a;border-radius:7px;overflow:hidden;background:#12151b;}
+.mmh3-pincard .mmh3-thumb{width:100%;height:auto;max-height:150px;object-fit:contain;
+  display:block;background:#0d1015;}
+.mmh3-pinbar{display:flex;align-items:center;gap:6px;padding:3px 6px;}
+.mmh3-auto{font-size:calc(9px * var(--mmh3-fs, 1));color:#6f86b8;border:1px solid #2b3a52;border-radius:7px;
+  padding:0 5px;margin-left:auto;}
+.mmh3-pinbar .mmh3-x{margin-left:auto;cursor:pointer;color:#6b7484;font-size:calc(11px * var(--mmh3-fs, 1));}
+.mmh3-pinbar .mmh3-x:hover{color:#e05a5a;}
+.mmh3-pinempty{border:1px dashed #2e3440;border-radius:7px;padding:8px 6px;text-align:center;
+  font-size:calc(10px * var(--mmh3-fs, 1));color:#5c6472;line-height:1.4;}
+.mmh3-card{width:64px;flex:0 0 auto;border:1px solid #2e3440;border-radius:7px;
+  overflow:hidden;background:#12151b;cursor:pointer;user-select:none;}
+.mmh3-card:hover{border-color:#59637a;}
+.mmh3-card.pic{border-color:#6d5527;} .mmh3-card.vid{border-color:#255c6b;}
+.mmh3-card.aud{border-color:#4c3d6e;}
+.mmh3-card .mmh3-thumb{width:100%;height:40px;object-fit:cover;display:block;
+  background:#0d1015;}
+.mmh3-wave{background:#0d1015;}
+.mmh3-cardbar{display:flex;align-items:center;gap:3px;padding:2px 4px;}
+.mmh3-tagname{font-family:ui-monospace,monospace;font-size:calc(9px * var(--mmh3-fs, 1));}
+.mmh3-tagname.pic{color:#e0a94c;} .mmh3-tagname.vid{color:#4cc3e0;}
+.mmh3-tagname.aud{color:#b48ce8;} .mmh3-tagname.subj{color:#7ec87e;}
+.mmh3-cite{margin-left:auto;font-size:calc(9px * var(--mmh3-fs, 1));color:#7a8393;font-family:ui-monospace,monospace;}
+.mmh3-cite.zero{color:#e0a94c;}
+.mmh3-cite.off{color:#5c6472;}
+.mmh3-card.unusable{opacity:.34;cursor:not-allowed;border-color:#2a2f3a !important;}
+.mmh3-card.unusable:hover{opacity:.5;border-color:#3a4252 !important;}
+.mmh3-card.unusable .mmh3-tagname{color:#6b7484 !important;}
+.mmh3-cardnote{display:block;font-size:calc(8px * var(--mmh3-fs, 1));color:#8a7ab0;padding:0 4px 3px;}
+.mmh3-card.refmod{position:relative;}
+.mmh3-cardbadge{position:absolute;top:2px;left:2px;background:rgba(8,10,14,.82);color:#e692c8;
+  border:1px solid #7a4d6b;border-radius:4px;font-size:calc(9px * var(--mmh3-fs, 1));line-height:1.3;
+  padding:0 3px;pointer-events:none;}
+.mmh3-cardvoice{position:absolute;top:22px;right:4px;color:#b48ce8;font-size:calc(12px * var(--mmh3-fs, 1));
+  text-shadow:0 0 3px #000,0 0 2px #000;pointer-events:none;}
+.mmh3-cardgroup{display:flex;flex-direction:column;gap:3px;flex:0 0 auto;}
+.mmh3-editthumb{position:relative;line-height:0;}
+.mmh3-editthumb .mml-mkoverlay{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;}
+.mmh3-card.mmh3-editsrc{border-color:#7a3d52 !important;}
+.mmh3-editbadge{color:#e86a8a !important;}
+.mmh3-editsrc .mmh3-thumb{object-fit:contain;background:#000;}
+.mmh3-card.mmh3-editsrc{position:relative;}
+.mmh3-maskmissing{position:absolute;right:3px;bottom:18px;color:#ffcf5a;text-shadow:0 0 3px #000;cursor:help;
+  font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-cardgroupcards{display:flex;gap:6px;}
+.mmh3-cardstrip{box-sizing:border-box;width:0;min-width:100%;font-size:calc(9px * var(--mmh3-fs, 1));
+  color:#8a93a3;border:1px solid #2e3440;border-radius:4px;padding:0 5px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;}
+.mmh3-cardgroup.refmod .mmh3-cardstrip{color:#e692c8;border-color:#7a4d6b;background:rgba(230,146,200,.10);}
+.mmh3-peekrefmod{display:flex;justify-content:space-between;gap:6px;font-size:calc(10px * var(--mmh3-fs, 1));
+  color:#e692c8;margin-bottom:3px;}
+.mmh3-peekrefmod span:last-child{color:#8a93a3;}
+.mmh3-peek{position:fixed;z-index:10002;width:240px;background:#1e222a;
+  border:1px solid #3a4252;border-radius:9px;overflow:hidden;
+  box-shadow:0 12px 32px rgba(0,0,0,.5);}
+.mmh3-peekmedia{width:100%;max-height:180px;object-fit:contain;display:block;
+  background:#0d1015;}
+.mmh3-peekmeta{padding:6px 8px;}
+.mmh3-peekrow{display:flex;align-items:center;gap:6px;}
+.mmh3-peekcite{margin-left:auto;font-size:calc(9px * var(--mmh3-fs, 1));color:#7a8393;}
+.mmh3-peekcite.zero{color:#e0a94c;}
+.mmh3-peeksrc{font-size:calc(9px * var(--mmh3-fs, 1));color:#6b7484;margin:2px 0 6px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;}
+.mmh3-peekbtns{display:flex;gap:5px;}
+.mmh3-peekbtns .mmh3-btn{flex:1;padding:3px 6px;font-size:calc(10px * var(--mmh3-fs, 1));}
+/* No top padding: the sticky media bar owns that space, so it can pin flush
+   to the top of the scroll area with nothing able to scroll past it. */
+.mmh3-form{overflow-y:auto;padding:0 16px 24px;min-width:0;}
+.mmh3-side{border-left:1px solid #2a2f3a;display:flex;flex-direction:column;min-height:0;background:#15181e;}
+.mmh3-sec{margin-bottom:16px;}
+.mmh3-rowpow{cursor:pointer;font-size:calc(11px * var(--mmh3-fs, 1));color:#3f4855;user-select:none;
+  flex-shrink:0;line-height:1;text-align:center;}
+.mmh3-defrow .mmh3-rowpow{align-self:flex-start;margin-top:11px;}
+.mmh3-rowpow.on{color:#6fbf73;}
+.mmh3-rowpow:hover{filter:brightness(1.35);}
+.mmh3-defrow.off textarea, .mmh3-retrow.off select, .mmh3-retrow.off input{
+  opacity:.4;text-decoration:line-through;}
+.mmh3-secpow{cursor:pointer;font-size:calc(11px * var(--mmh3-fs, 1));margin-right:6px;color:#3f4855;
+  user-select:none;vertical-align:baseline;}
+.mmh3-secpow.on{color:#6fbf73;}
+.mmh3-secpow:hover{filter:brightness(1.35);}
+.mmh3-sec>label.off{opacity:.45;text-decoration:line-through;}
+.mmh3-sec>label.off ~ *{opacity:.45;}
+.mmh3-sec>label{display:block;font-size:calc(11px * var(--mmh3-fs, 1));text-transform:uppercase;letter-spacing:.08em;
+  color:#8a93a3;margin-bottom:5px;}
+.mmh3-refmodnone{font-size:calc(10.5px * var(--mmh3-fs, 1));color:#6b7484;font-style:italic;align-self:center;}
+.mmh3-sec .hint{font-size:calc(11px * var(--mmh3-fs, 1));color:#6b7484;margin-top:4px;line-height:1.4;}
+.mmh3-form textarea,.mmh3-form input[type=text],.mmh3-form input[type=number],.mmh3-form select{
+  width:100%;box-sizing:border-box;background:#12151b;color:#dde2ea;border:1px solid #2e3440;
+  border-radius:6px;padding:7px 9px;font-size:calc(13px * var(--mmh3-fs, 1));font-family:inherit;}
+.mmh3-form textarea{resize:vertical;line-height:1.5;}
+.mmh3-form textarea:focus,.mmh3-form input:focus,.mmh3-form select:focus{
+  outline:none;border-color:#4a5568;}
+.mmh3-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
+.mmh3-clearbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  background:#2b2320;border:1px solid #7a4a3a;border-radius:7px;padding:8px 10px;
+  margin-bottom:10px;font-size:calc(12px * var(--mmh3-fs, 1));color:#e8c4b4;}
+.mmh3-clearnote{font-size:calc(11px * var(--mmh3-fs, 1));color:#a08878;}
+/* The buttons live in their own nowrap group pinned right, so a narrow
+   window wraps the MESSAGE instead of stranding one button on a new line
+   at the far left. */
+.mmh3-clearactions{display:flex;gap:8px;flex-wrap:nowrap;margin-left:auto;
+  flex-shrink:0;}
+.mmh3-clearmsg{flex:1 1 220px;min-width:0;}
+.mmh3-prefwrap{position:relative;display:inline-block;}
+.mmh3-x.on{color:#dde2ea;}
+/* Fixed type inside the settings menu: scaling it would make the control
+   that undoes a large text size unreadable. */
+.mmh3-prefmenu{--mmh3-fs:1;position:absolute;right:0;top:100%;margin-top:6px;
+  z-index:20;display:none;width:292px;background:#1e222a;border:1px solid #3a4252;
+  border-radius:9px;padding:8px;box-shadow:0 16px 40px rgba(0,0,0,.55);}
+.mmh3-prefmenu.on{display:block;}
+.mmh3-scalerow{display:flex;align-items:center;gap:8px;padding:5px 6px;}
+.mmh3-scalelabel{font-size:calc(11px * var(--mmh3-fs, 1));color:#8a93a3;
+  width:80px;flex:0 0 auto;white-space:nowrap;}
+.mmh3-scalerange{flex:1;min-width:0;}
+.mmh3-scaleval{font-size:calc(10px * var(--mmh3-fs, 1));color:#d7dbe2;
+  font-family:ui-monospace,monospace;width:58px;text-align:right;flex:0 0 auto;
+  background:#12151b;border:1px solid #2e3440;border-radius:5px;padding:2px 4px;}
+.mmh3-scaleval:focus{outline:none;border-color:#4a5568;}
+.mmh3-scalepct{font-size:calc(10px * var(--mmh3-fs, 1));color:#6b7484;
+  flex:0 0 auto;margin-left:-2px;}
+.mmh3-scalefoot{display:flex;gap:6px;justify-content:flex-end;padding:2px 6px 0;}
+.mmh3-prefsep{height:1px;background:#2e3440;margin:6px 4px;}
+.mmh3-prefversion{border-top:1px solid #2e3440;margin-top:6px;padding:7px 6px 2px;
+  font-size:calc(9px * var(--mmh3-fs, 1));color:#6b7484;
+  font-family:ui-monospace,monospace;}
+.mmh3-prefitem{display:flex;gap:8px;align-items:flex-start;padding:6px;
+  border-radius:6px;cursor:pointer;}
+.mmh3-prefitem:hover{background:#242a34;}
+.mmh3-prefitem input{margin-top:2px;flex-shrink:0;}
+.mmh3-prefselect select{flex:0 0 auto;margin-top:1px;}
+.mmh3-preflabel{display:block;font-size:calc(12px * var(--mmh3-fs, 1));color:#d7dbe2;}
+.mmh3-prefhint{display:block;font-size:calc(10px * var(--mmh3-fs, 1));color:#6b7484;line-height:1.35;
+  margin-top:2px;}
+.mmh3-btn.mmh3-danger{border-color:#5c3a3a;color:#e08585;}
+.mmh3-btn.mmh3-danger:hover{background:#3a2626;color:#f0a0a0;}
+/* Full-bleed: negative side margins cancel the form's padding, so the bar's
+   background covers the gutters too. Text used to scroll visibly through
+   them and through the strip above the bar. */
+.mmh3-dialogrow{margin-top:6px;}
+/* nowrap matters: with wrapping allowed, flexbox breaks the line before it
+   shrinks anything, so a long phrase name pushed the buttons onto a second
+   row instead of narrowing the picker. */
+/* Compound selector so this beats .mmh3-tools, which sets flex-wrap:wrap
+   later in the sheet at the same specificity. */
+.mmh3-tools.mmh3-phraserow{margin-top:6px;flex-wrap:nowrap;}
+.mmh3-phrasewarn{font-size:calc(12px * var(--mmh3-fs, 1));color:#e8b46a;}
+.mmh3-phrasepeek{position:fixed;z-index:10005;max-width:420px;
+  box-sizing:border-box;background:#1e222a;
+  border:1px solid #3a4252;border-radius:9px;padding:8px 10px;
+  box-shadow:0 16px 40px rgba(0,0,0,.55);pointer-events:none;}
+.mmh3-phrasepeekhead{display:flex;gap:8px;align-items:baseline;
+  margin-bottom:5px;}
+.mmh3-phrasepeekhead span:first-child{font-size:calc(11px * var(--mmh3-fs, 1));color:#e692c8;
+  font-weight:600;}
+.mmh3-phrasepeekcat{font-size:calc(9px * var(--mmh3-fs, 1));color:#6b7484;text-transform:uppercase;
+  letter-spacing:.06em;}
+.mmh3-phrasepeektext{font-size:calc(12px * var(--mmh3-fs, 1));color:#a9b2c2;line-height:1.5;
+  white-space:pre-wrap;max-height:220px;overflow:hidden;}
+.mmh3-tagpeekwhat{margin-top:5px;font-size:calc(11px * var(--mmh3-fs, 1));color:#6b7484;line-height:1.45;}
+.mmh3-ctxmenu{position:fixed;z-index:10006;min-width:190px;background:#1e222a;
+  border:1px solid #3a4252;border-radius:8px;padding:4px;
+  box-shadow:0 16px 40px rgba(0,0,0,.55);}
+.mmh3-ctxitem{padding:7px 10px;border-radius:6px;font-size:calc(12px * var(--mmh3-fs, 1));color:#d7dbe2;
+  cursor:pointer;white-space:nowrap;}
+.mmh3-ctxitem:hover{background:#2a313d;}
+.mmh3-tagpick{position:absolute;z-index:10006;width:350px;background:#1b1f27;border:1px solid #3a4252;border-radius:9px;
+  padding:9px;box-shadow:0 12px 32px rgba(0,0,0,.5);color:#d7dbe2;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-tagpickhead{display:flex;align-items:center;gap:8px;margin-bottom:8px;}
+.mmh3-tagpicktag{font-family:ui-monospace,monospace;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-tagpickgrow{flex:1;}
+.mmh3-tagpickrow{display:flex;align-items:center;gap:6px;margin-bottom:7px;}
+.mmh3-tagpicklbl{width:56px;flex:0 0 auto;color:#8a93a3;font-size:calc(10.5px * var(--mmh3-fs, 1));}
+.mmh3-tagseg{display:inline-flex;border:1px solid #3a4252;border-radius:6px;overflow:hidden;}
+.mmh3-tagseg button{background:#12151b;border:0;border-right:1px solid #3a4252;color:#8a93a3;padding:3px 8px;
+  font-size:calc(11px * var(--mmh3-fs, 1));cursor:pointer;font-family:inherit;}
+.mmh3-tagseg button:last-child{border-right:0;}
+.mmh3-tagseg button.on{background:#2b3140;color:#d7dbe2;}
+.mmh3-tagseg button:disabled{opacity:.4;cursor:default;}
+.mmh3-tagpickgrid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin-bottom:8px;
+  max-height:250px;overflow:auto;}
+.mmh3-tagpickopt{display:flex;flex-direction:column;gap:3px;min-width:0;text-align:left;background:#12151b;
+  border:1px solid #2e3440;border-radius:7px;padding:5px;cursor:pointer;color:#d7dbe2;font-family:inherit;}
+.mmh3-tagpickopt:hover{border-color:#6f86b8;background:#1b2230;}
+.mmh3-tagpickthumb{position:relative;height:48px;border-radius:5px;overflow:hidden;background:#0d1015;display:flex;align-items:center;
+  justify-content:center;color:#6b7484;font-weight:600;font-size:calc(11px * var(--mmh3-fs, 1));}
+.mmh3-tagpickthumb .mmh3-thumb{width:100%;height:100%;object-fit:cover;display:block;border-radius:0;}
+.mmh3-tagpicknm{font-family:ui-monospace,monospace;font-size:calc(10.5px * var(--mmh3-fs, 1));white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;}
+.mmh3-tagpickun{position:absolute;left:3px;top:3px;padding:0 4px;border-radius:4px;background:rgba(18,21,27,.85);
+  border:1px solid rgba(224,169,76,.55);color:#e0a94c;font-family:system-ui,sans-serif;font-weight:500;
+  font-size:calc(9px * var(--mmh3-fs, 1));line-height:1.4;}
+.mmh3-tagpicksub{color:#6b7484;font-size:calc(10px * var(--mmh3-fs, 1));white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.mmh3-tagpickfoot{display:flex;align-items:center;gap:8px;border-top:1px solid #2a2f3a;padding-top:8px;}
+.mmh3-tagpicknote{color:#8a93a3;font-size:calc(10.5px * var(--mmh3-fs, 1));}
+.mmh3-tagpicknone{color:#8a93a3;padding:4px 2px 10px;font-size:calc(11px * var(--mmh3-fs, 1));}
+.mmh3-phraseover{z-index:10004;display:flex;align-items:center;
+  justify-content:center;}
+.mmh3-phrasemodal{width:min(520px,92vw);background:#191c22;
+  border:1px solid #303642;border-radius:10px;overflow:hidden;
+  box-shadow:0 24px 64px rgba(0,0,0,.55);}
+.mmh3-phrasebody{padding:12px 14px;display:flex;flex-direction:column;gap:6px;}
+.mmh3-phrasebody label{font-size:calc(11px * var(--mmh3-fs, 1));text-transform:uppercase;
+  letter-spacing:.08em;color:#8a93a3;}
+.mmh3-phrasetext{width:100%;box-sizing:border-box;background:#12151b;
+  color:#dde2ea;border:1px solid #2e3440;border-radius:6px;padding:7px 9px;
+  font-size:calc(13px * var(--mmh3-fs, 1));font-family:inherit;line-height:1.6;resize:vertical;}
+.mmh3-phrasetext:focus{outline:none;border-color:#4a5568;}
+.mmh3-phrasefoot{display:flex;align-items:center;gap:8px;padding:10px 14px;
+  border-top:1px solid #2a2f3a;background:#1b1f27;}
+.mmh3-phrasecat{flex:0 1 150px;min-width:70px;}
+/* The phrase names are the long ones, so this picker absorbs whatever room
+   is left rather than truncating at a fixed width. */
+.mmh3-phrasesel{flex:1 1 120px;min-width:0;max-width:none;}
+.mmh3-toolspace{flex:0 0 8px;}
+.mmh3-toolgrow{flex:1 1 auto;}
+.mmh3-phraserow .mmh3-btn,.mmh3-phraserow .mmh3-toollabel{flex:0 0 auto;
+  white-space:nowrap;}
+.mmh3-toollabel{font-size:calc(10px * var(--mmh3-fs, 1));text-transform:uppercase;letter-spacing:.07em;
+  color:#7d8698;align-self:center;}
+.mmh3-toolsep{width:1px;height:18px;background:#2e3440;align-self:center;}
+.mmh3-btn.ghost{opacity:.7;border-style:dashed;}
+.mmh3-chipbar{position:sticky;top:0;z-index:5;background:#191c22;
+  padding:12px 16px 10px;margin:0 -16px 14px;
+  border-bottom:1px solid #242a34;}
+.mmh3-chips{display:flex;gap:6px;overflow-x:auto;padding-bottom:3px;align-items:flex-start;}
+.mmh3-chips::-webkit-scrollbar{height:6px;}
+.mmh3-chips::-webkit-scrollbar-thumb{background:#2e3440;border-radius:3px;}
+.mmh3-chip{display:inline-flex;align-items:center;gap:6px;border-radius:14px;cursor:pointer;
+  border:1px solid #363d4a;background:#20242d;color:#c9cfda;font-size:calc(12px * var(--mmh3-fs, 1));
+  padding:3px 10px;user-select:none;}
+.mmh3-chip:hover{border-color:#59637a;background:#262c38;}
+.mmh3-chip img,.mmh3-chip video{width:22px;height:22px;object-fit:cover;border-radius:4px;}
+.mmh3-chip.pic{border-color:#8a6a2c;} .mmh3-chip.pic b{color:#e0a94c;}
+.mmh3-chip.vid{border-color:#2c6f81;} .mmh3-chip.vid b{color:#4cc3e0;}
+.mmh3-chip.aud{border-color:#5d4a86;} .mmh3-chip.aud b{color:#b48ce8;}
+.mmh3-chip.subj{border-color:#3e6b3e;} .mmh3-chip.subj b{color:#7ec87e;}
+.mmh3-chip b{font-weight:600;}
+.mmh3-chipnote{font-size:calc(9px * var(--mmh3-fs, 1));font-style:normal;opacity:.75;letter-spacing:.02em;
+  border-left:1px solid #4a4260;padding-left:5px;margin-left:1px;}
+.mmh3-subjrow{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px;}
+.mmh3-tools{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;align-items:center;}
+.mmh3-tools select{width:auto;background:#12151b;color:#c9cfda;border:1px solid #2e3440;
+  border-radius:6px;padding:4px 6px;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-tools input[type=number]{width:84px;background:#12151b;color:#c9cfda;
+  border:1px solid #2e3440;border-radius:6px;padding:4px 6px;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-tools input[type=number]:focus{outline:none;border-color:#4a5568;}
+.mmh3-btn{background:#2b3140;border:1px solid #3a4252;color:#d7dbe2;border-radius:6px;
+  padding:5px 12px;font-size:calc(12px * var(--mmh3-fs, 1));cursor:pointer;}
+.mmh3-btn:hover{background:#333b4d;}
+.mmh3-btn.primary{background:#3f5a86;border-color:#4d6ea6;color:#fff;}
+.mmh3-btn.danger{border-color:#7a4a3a;color:#e0a090;} .mmh3-btn.danger:hover{background:#3a2622;}
+.mmh3-btn.off,.mmh3-btn:disabled{background:#22262e;border-color:#2e3440;
+  color:#5c6472;cursor:not-allowed;}
+.mmh3-btn.off:hover,.mmh3-btn:disabled:hover{background:#22262e;}
+.mmh3-btn.primary:hover{background:#48679a;}
+.mmh3-btn.ghost{background:none;border-color:transparent;color:#8a93a3;}
+.mmh3-btn.ghost:hover{color:#e05a5a;}
+.mmh3-defrow{display:flex;gap:6px;margin-bottom:6px;align-items:flex-start;}
+.mmh3-defrow textarea{flex:1;min-height:38px;}
+.mmh3-form .mmh3-defrow textarea{flex:1 1 auto;min-width:0;}
+.mmh3-form .mmh3-defrow input[type=text].mmh3-defname{width:110px;flex:0 0 110px;min-width:0;align-self:flex-start;}
+.mmh3-form .mmh3-defrow input[type=text].mmh3-defname[hidden]{display:none;}
+.mmh3-form .mmh3-defrow input[type=text].mmh3-defname.mmh3-defvoice{width:190px;flex:0 0 190px;}
+.mmh3-spksplit{display:inline-flex;}
+.mmh3-spksplit .mmh3-spkmain{border-top-right-radius:0;border-bottom-right-radius:0;}
+.mmh3-spksplit .mmh3-spkarrow{border-top-left-radius:0;border-bottom-left-radius:0;border-left:0;padding-left:5px;padding-right:5px;}
+.mmh3-spkmenu{position:absolute;z-index:10006;min-width:300px;max-width:480px;background:#1b1f27;border:1px solid #3a4252;
+  border-radius:8px;padding:4px;box-shadow:0 8px 24px rgba(0,0,0,.45);}
+.mmh3-spkitem{display:block;width:100%;text-align:left;background:none;border:0;border-radius:6px;padding:7px 9px;
+  color:#d7dbe2;cursor:pointer;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-spkitem:hover{background:#262c36;}
+.mmh3-spkitem small{display:block;margin-top:3px;color:#8e97a6;font-family:ui-monospace,monospace;
+  font-size:calc(11px * var(--mmh3-fs, 1));white-space:normal;}
+.mmh3-spkitem.off{cursor:default;opacity:.6;}
+.mmh3-spkitem.off:hover{background:none;}
+.mmh3-chipname{color:#a9b2c2;font-size:calc(10px * var(--mmh3-fs, 1));}
+.mmh3-minitags{display:flex;gap:4px;flex-wrap:wrap;margin:-2px 0 8px 2px;min-height:14px;}
+.mmh3-minitag{font-size:calc(10px * var(--mmh3-fs, 1));border-radius:8px;padding:1px 7px;background:#20242d;border:1px solid #363d4a;}
+.mmh3-minitag.pic{color:#e0a94c;border-color:#8a6a2c;}
+.mmh3-minitag.vid{color:#4cc3e0;border-color:#2c6f81;}
+.mmh3-minitag.aud{color:#b48ce8;border-color:#5d4a86;}
+.mmh3-minitag.subj{color:#7ec87e;border-color:#3e6b3e;}
+.mmh3-roles{display:flex;flex-wrap:wrap;gap:4px;align-items:center;margin:-4px 0 10px 2px;}
+.mmh3-conceptover{position:fixed;inset:0;z-index:10007;background:rgba(8,10,14,.55);display:flex;
+  align-items:center;justify-content:center;}
+.mmh3-conceptbox{width:min(440px,92vw);background:#1e222a;border:1px solid #3a4252;border-radius:10px;
+  padding:14px 16px;display:flex;flex-direction:column;gap:9px;color:#d7dbe2;
+  box-shadow:0 24px 64px rgba(0,0,0,.55);font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-concepthead{font-weight:600;font-size:calc(14px * var(--mmh3-fs, 1));}
+.mmh3-conceptrow{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.mmh3-conceptrow span{color:#e692c8;} .mmh3-conceptrow small{color:#8a93a3;}
+.mmh3-conceptrow select{flex:0 1 220px;}
+.mmh3-conceptbtns{display:flex;justify-content:flex-end;gap:6px;margin-top:4px;}
+.mmh3-conceptbox .mmh3-dim{color:#8a93a3;font-size:calc(11px * var(--mmh3-fs, 1));}
+.mmh3-conceptbox .mmh3-inline{display:flex;align-items:center;gap:6px;color:#a9b2c2;}
+.mmh3-rolelabel{font-size:calc(10px * var(--mmh3-fs, 1));text-transform:uppercase;letter-spacing:.07em;
+  color:#6b7484;margin-right:2px;}
+.mmh3-rolechip{font-size:calc(11px * var(--mmh3-fs, 1));border-radius:10px;padding:2px 9px;cursor:pointer;
+  background:#1d2029;border:1px solid #3a3050;color:#a99ac4;user-select:none;}
+.mmh3-rolechip:hover{border-color:#5d4a86;color:#c9b9e6;background:#241f33;}
+.mmh3-rolechip.on{background:#3a2f56;border-color:#7d63b8;color:#e2d6f8;}
+.mmh3-ttypes{display:flex;flex-wrap:wrap;gap:4px 12px;margin-bottom:6px;}
+.mmh3-ttypes label{display:flex;gap:5px;align-items:center;font-size:calc(12px * var(--mmh3-fs, 1));color:#c9cfda;
+  text-transform:none;letter-spacing:0;cursor:pointer;}
+.mmh3-retrow{display:grid;grid-template-columns:14px 150px 1fr 160px 26px;gap:6px;
+  margin-bottom:6px;align-items:center;}
+.mmh3-retrow input,.mmh3-retrow select{font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-retnote{grid-column:1/-1;margin-top:-2px;}
+.mmh3-preview{flex:1;overflow:auto;margin:0;padding:12px 14px;font:12px/1.55 ui-monospace,
+  SFMono-Regular,Menlo,Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:#c4cad5;}
+.mmh3-preview .t-pic{color:#e0a94c;} .mmh3-preview .t-vid{color:#4cc3e0;}
+.mmh3-preview .t-aud{color:#b48ce8;} .mmh3-preview .t-subj{color:#7ec87e;}
+.mmh3-preview .t-shot{color:#7ea7d8;font-weight:600;}
+.mmh3-preview .t-d{color:#d8c07e;}
+.mmh3-issues{max-height:180px;overflow:auto;border-top:1px solid #2a2f3a;padding:8px 14px;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-issues .error{color:#f07070;margin:3px 0;font-weight:500;}
+.mmh3-issues .warn{color:#e0a94c;margin:3px 0;}
+.mmh3-issues .info{color:#8a93a3;margin:3px 0;}
+.mmh3-issues .ok{color:#7ec87e;}
+.mmh3-foot{display:flex;gap:8px;align-items:center;padding:10px 14px;border-top:1px solid #2a2f3a;}
+.mmh3-foot .stats{font-size:calc(11px * var(--mmh3-fs, 1));color:#6b7484;margin-right:auto;}
+.mmh3-summary{width:100%;box-sizing:border-box;background:#181b21;border:1px solid #2b303b;
+  border-radius:6px;padding:6px 9px;font-size:calc(11px * var(--mmh3-fs, 1));line-height:1.5;color:#9aa3b2;
+  overflow:hidden;cursor:default;}
+.mmh3-summary b{color:#d7dbe2;}
+.mmh3-reforder{width:100%;height:100%;box-sizing:border-box;display:flex;flex-direction:column;background:#181b21;
+  border:1px solid #2b303b;border-radius:6px;padding:4px 10px;font-size:13px;line-height:20px;color:#9aa3b2;overflow:hidden;}
+.mmh3-reforder-head{flex:0 0 24px;line-height:24px;cursor:pointer;color:#e6e9ef;font-weight:600;white-space:nowrap;
+  display:flex;align-items:center;gap:6px;min-width:0;}
+.mmh3-reforder-head .caret{flex:0 0 10px;color:#8b93a3;}
+.mmh3-reforder-head .title{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;}
+.mmh3-reforder-thumbs{flex:0 0 auto;background:#232833;border:1px solid #3a4252;border-radius:5px;color:#d7dbe2;
+  font:inherit;font-size:12px;font-weight:500;line-height:18px;padding:0 7px;cursor:pointer;}
+.mmh3-reforder-thumbs:hover{border-color:#59637a;}
+.mmh3-reforder-thumbs:disabled{opacity:.4;cursor:default;}
+.mmh3-reforder-list{flex:0 1 auto;min-height:0;max-height:200px;overflow-y:auto;scrollbar-width:thin;
+  scrollbar-color:#4b5363 transparent;}
+.mmh3-reforder-row{display:flex;gap:10px;height:20px;white-space:nowrap;}
+.mmh3-reforder-row .num{flex:0 0 18px;text-align:right;color:#8b93a3;}
+.mmh3-reforder-row .tag{flex:0 0 auto;min-width:96px;font-family:ui-monospace,monospace;}
+.mmh3-reforder-row .tag.pic,.mmh3-thumbtag .tag.pic{color:#e0a94c;}
+.mmh3-reforder-row .tag.vid,.mmh3-thumbtag .tag.vid{color:#4cc3e0;}
+.mmh3-reforder-row .tag.aud,.mmh3-thumbtag .tag.aud{color:#b48ce8;}
+.mmh3-reforder-row .name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;color:#e6e9ef;}
+.mmh3-reforder-row .more{color:#8b93a3;}
+.mmh3-reforder-group{height:20px;padding-left:28px;color:#8b93a3;font-size:12px;font-weight:600;}
+.mmh3-reforder-note{flex:0 0 auto;color:#e0a94c;}
+.mmh3-reforder-note div{height:20px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.mmh3-mapbox .mmh3-reforder-head{cursor:default;}
+.mmh3-mapbox .mmh3-reforder-head .title{color:#8b93a3;font-weight:500;}
+.mmh3-mapbox-text{flex:0 0 auto;width:100%;box-sizing:border-box;resize:none;margin:0;padding:4px 7px;
+  background:#12151b;color:#e6e9ef;border:1px solid #2b303b;border-radius:5px;outline:none;
+  font:12px/18px ui-monospace,monospace;white-space:pre;overflow:auto;scrollbar-width:thin;scrollbar-color:#4b5363 transparent;}
+.mmh3-thumbs{width:min(1000px,94vw);height:auto;max-height:90vh;--mml-fs:1.25;}
+.mmh3-thumbscroll{flex:1 1 auto;min-height:0;overflow-y:auto;padding:12px 16px 16px;display:flex;flex-direction:column;
+  gap:8px;font-size:13px;}
+.mmh3-thumbsec{color:#8b93a3;font-size:12px;font-weight:600;}
+.mmh3-thumbgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;}
+.mmh3-thumbcard{display:flex;flex-direction:column;gap:3px;min-width:0;padding:6px;background:#1d2027;
+  border:1px solid #303642;border-radius:8px;}
+.mmh3-thumbart{position:relative;height:120px;margin-bottom:3px;border-radius:6px;background:#101217;overflow:hidden;
+  display:flex;align-items:center;justify-content:center;}
+.mmh3-thumbart .mml-vthumbwrap{width:100%;height:100%;min-width:0;border-radius:0;}
+.mmh3-thumbart .mml-vthumb{width:100%;height:100%;min-width:0;max-width:none;border-radius:0;}
+.mmh3-thumbart .mml-row{width:100%;}
+.mmh3-thumbimg{width:100%;height:100%;object-fit:contain;display:block;}
+.mmh3-thumbname{font-weight:600;color:#e6e9ef;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.mmh3-thumbtag{display:flex;gap:6px;font-size:12px;line-height:18px;white-space:nowrap;min-width:0;}
+.mmh3-thumbtag .tag{flex:0 0 auto;font-family:ui-monospace,monospace;}
+.mmh3-thumbtag .more{min-width:0;overflow:hidden;text-overflow:ellipsis;color:#8b93a3;}
+.mmh3-libmodal{width:min(940px,94vw);height:min(640px,90vh);display:flex;
+  flex-direction:column;background:#191c22;color:#d7dbe2;border:1px solid #303642;
+  border-radius:10px;overflow:hidden;box-shadow:0 24px 64px rgba(0,0,0,.55);}
+.mmh3-libbar{display:flex;gap:6px;align-items:center;padding:8px 12px;
+  border-bottom:1px solid #2a2f3a;background:#1b1f27;}
+.mmh3-libbar input{flex:1;min-width:0;background:#12151b;color:#dde2ea;
+  border:1px solid #2e3440;border-radius:6px;padding:5px 9px;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-libbar select{background:#12151b;color:#c9cfda;border:1px solid #2e3440;
+  border-radius:6px;padding:5px 7px;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-libbar input:focus,.mmh3-libbar select:focus{outline:none;border-color:#4a5568;}
+.mmh3-btn.on{background:#3a2f56;border-color:#7d63b8;color:#e2d6f8;}
+.mmh3-liblist{flex:1;overflow:auto;padding:6px 8px;}
+.mmh3-saveform{background:#1d222b;border:1px solid #3a4252;border-radius:8px;
+  padding:8px;margin-bottom:8px;}
+.mmh3-saverow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+.mmh3-savecat{background:#12151b;color:#d7dbe2;border:1px solid #2e3440;
+  border-radius:7px;padding:6px 8px;font-size:calc(12px * var(--mmh3-fs, 1));max-width:190px;}
+.mmh3-savecat:focus{outline:none;border-color:#4a5568;}
+.mmh3-saverow input[type=text]{flex:1;min-width:130px;background:#12151b;
+  color:#dde2ea;border:1px solid #2e3440;border-radius:6px;padding:5px 9px;
+  font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-saverow input[type=text]:focus{outline:none;border-color:#4a5568;}
+.mmh3-savefav{display:flex;align-items:center;gap:4px;font-size:calc(11px * var(--mmh3-fs, 1));
+  color:#8a93a3;white-space:nowrap;cursor:pointer;}
+.mmh3-saveerr{display:block;font-size:calc(11px * var(--mmh3-fs, 1));color:#f07070;margin-top:5px;}
+.mmh3-saveerr:empty{display:none;}
+.mmh3-librow.confirm{background:#241f2b;border-left:2px solid #7d63b8;}
+.mmh3-librow{display:flex;align-items:center;gap:8px;padding:7px 8px;
+  border-bottom:1px solid #23272f;}
+.mmh3-librow:hover{background:#1d222b;}
+.mmh3-star{background:none;border:0;color:#5c6472;font-size:calc(15px * var(--mmh3-fs, 1));cursor:pointer;
+  padding:0 2px;line-height:1;}
+.mmh3-star.on{color:#e0a94c;}
+.mmh3-star:hover{color:#e0a94c;}
+.mmh3-libmain{flex:1;min-width:0;}
+.mmh3-libtop{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.mmh3-libname{font-size:calc(13px * var(--mmh3-fs, 1));color:#dde2ea;}
+.mmh3-libmode{font-size:calc(9px * var(--mmh3-fs, 1));text-transform:uppercase;letter-spacing:.06em;
+  border:1px solid #2b3a52;color:#7ea7d8;border-radius:8px;padding:0 6px;}
+.mmh3-libcat{font-size:calc(9px * var(--mmh3-fs, 1));border:1px solid #3e5240;color:#7ec87e;border-radius:8px;
+  padding:0 6px;cursor:pointer;}
+.mmh3-libcat:hover{border-color:#7ec87e;background:#1e2a1e;}
+.mmh3-libcat.none{border-color:#333a45;color:#5c6472;}
+.mmh3-libcat.none:hover{border-color:#59637a;color:#8a93a3;background:none;}
+.mmh3-catlbl{font-size:calc(11px * var(--mmh3-fs, 1));color:#8a93a3;white-space:nowrap;}
+.mmh3-libage{margin-left:auto;font-size:calc(10px * var(--mmh3-fs, 1));color:#5c6472;}
+.mmh3-libprev{font-size:calc(11px * var(--mmh3-fs, 1));color:#6b7484;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;margin-top:2px;font-family:ui-monospace,monospace;}
+.mmh3-libacts{display:flex;gap:5px;flex-shrink:0;}
+.mmh3-libempty{padding:26px 12px;text-align:center;color:#6b7484;font-size:calc(12px * var(--mmh3-fs, 1));}
+.mmh3-toast.bad{background:#3a2020;border-color:#7a3a3a;color:#f0c0c0;
+  max-width:min(560px,90vw);}
+.mmh3-toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:10001;
+  background:#2b3140;color:#fff;border:1px solid #4a5568;border-radius:8px;
+  padding:8px 16px;font-size:calc(13px * var(--mmh3-fs, 1));}
+
+/* Reference chips. The mirror div sits under a textarea whose own text is
+   transparent, so the browser keeps selection/undo/IME while the tags get
+   styled. Every metric below is copied from .mmh3-form textarea — any
+   difference and the chips drift off the words as lines wrap. This block is
+   last, and uses .mmh3-chiptext, so it wins over the generic form rules. */
+/* The wrapper carries the field's frame; the textarea inside is invisible
+   except for its caret and selection. */
+.mmh3-chipwrap{position:relative;display:block;background:#12151b;
+  border:1px solid #2e3440;border-radius:6px;}
+.mmh3-chipwrap:focus-within{border-color:#4a5568;}
+/* Those two sections put the field in a flex row beside an N/A button; the
+   wrapper has to claim the space the bare textarea used to. */
+.mmh3-row .mmh3-chipwrap{flex:1;min-width:0;}
+.mmh3-chipmirror,
+.mmh3-chipwrap textarea.mmh3-chiptext{
+  width:100%;box-sizing:border-box;border:1px solid transparent;
+  border-radius:6px;padding:7px 9px;font-size:calc(13px * var(--mmh3-fs, 1));font-family:inherit;
+  line-height:1.7;letter-spacing:normal;white-space:pre-wrap;
+  overflow-wrap:break-word;word-break:normal;tab-size:4;}
+.mmh3-chipmirror{position:absolute;inset:0;overflow:hidden;pointer-events:none;
+  color:#dde2ea;background:transparent;z-index:1;}
+.mmh3-chipwrap textarea.mmh3-chiptext{position:relative;display:block;
+  background:transparent;color:transparent;caret-color:#dde2ea;
+  resize:vertical;z-index:0;}
+.mmh3-chipwrap textarea.mmh3-chiptext:focus{outline:none;}
+.mmh3-chipwrap textarea.mmh3-chiptext::selection{
+  background:rgba(96,140,210,.38);color:transparent;}
+.mmh3-chipwrap textarea.mmh3-chiptext::placeholder{color:#5c6472;}
+/* Layout-neutral by construction. The mirror only lines up with the textarea
+   if a chip advances the text exactly as its bare glyphs would, so there is
+   no padding, no margin and no border here — the breathing room is an OUTER
+   box-shadow spread, which paints beyond the box without occupying space.
+   Anything that changes the advance shifts wrap points, and the error
+   compounds line after line. */
+/* Plain mode. Nothing here changes metrics — the mirror still lays the text
+   out exactly as before, it just paints nothing, and the textarea shows its
+   own text instead. The tag spans stay in place, so hover previews still
+   find them. */
+.mmh3-chipwrap.plain textarea.mmh3-chiptext{color:#dde2ea;}
+.mmh3-chipwrap.plain textarea.mmh3-chiptext::selection{
+  background:rgba(96,140,210,.45);color:#fff;}
+.mmh3-chipwrap.plain .mmh3-chipmirror{color:transparent;}
+/* A name suggestion after the caret: grey in both modes, Tab fills it in. */
+.mmh3-chipmirror .mmh3-ghost,.mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-ghost{color:#6b7484;}
+.mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-reftag,
+.mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-dblock,
+.mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-dmark,
+.mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-dlang,
+.mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-dtag,
+.mmh3-chipwrap.plain .mmh3-chipmirror .mmh3-dtext{
+  color:transparent;background:none;box-shadow:none;}
+.mmh3-reftag{border-radius:3px;background:rgba(224,169,76,.18);color:#e0a94c;
+  box-shadow:0 0 0 2px rgba(224,169,76,.18), inset 0 0 0 1px rgba(224,169,76,.45);
+  -webkit-box-decoration-break:clone;box-decoration-break:clone;}
+.mmh3-reftag.vid{background:rgba(76,195,224,.18);color:#4cc3e0;
+  box-shadow:0 0 0 2px rgba(76,195,224,.18), inset 0 0 0 1px rgba(76,195,224,.45);}
+.mmh3-reftag.aud{background:rgba(180,140,232,.18);color:#b48ce8;
+  box-shadow:0 0 0 2px rgba(180,140,232,.18), inset 0 0 0 1px rgba(180,140,232,.45);}
+.mmh3-reftag.subj{background:rgba(111,191,115,.18);color:#6fbf73;
+  box-shadow:0 0 0 2px rgba(111,191,115,.18), inset 0 0 0 1px rgba(111,191,115,.45);}
+.mmh3-reftag.unknown{background:rgba(240,112,112,.16);color:#f07070;
+  box-shadow:0 0 0 2px rgba(240,112,112,.16), inset 0 0 0 1px rgba(240,112,112,.5);}
+.mmh3-reftag.spk{background:rgba(126,167,216,.16);color:#7ea7d8;
+  box-shadow:0 0 0 2px rgba(126,167,216,.16), inset 0 0 0 1px rgba(126,167,216,.4);}
+/* Cut markers are the loudest thing in a prompt, so they're the only SOLID
+   chip: every other tag is a translucent tint. The weight does the work, which
+   also means the hue doesn't have to compete with audio's violet or the red
+   that means "undefined tag". */
+/* No font-weight here, ever: bold widens the glyphs, so the mirror's [Shot N]
+   advanced further than the textarea's invisible regular-weight copy — a few
+   px of caret drift on that line, or a whole word once the widened line
+   wrapped earlier than the real one. The double text-shadow fakes the weight
+   without touching a single glyph advance. */
+.mmh3-reftag.shot{background:#a34b7d;color:#ffe9f4;
+  text-shadow:0.02em 0 currentColor,-0.02em 0 currentColor;
+  box-shadow:0 0 0 2px #a34b7d, inset 0 0 0 1px rgba(255,255,255,.18);}
+/* Spoken lines. The band shows how much of a paragraph is actually speech;
+   the markers dim because they're syntax, not words the model will say.
+   box-decoration-break keeps the band intact when a line wraps. */
+.mmh3-dblock{background:rgba(126,167,216,.10);border-radius:3px;
+  box-shadow:0 0 0 2px rgba(126,167,216,.10),
+             inset 0 0 0 1px rgba(126,167,216,.28);
+  -webkit-box-decoration-break:clone;box-decoration-break:clone;}
+.mmh3-dmark{color:#5f7899;}
+.mmh3-dlang{color:#9dc0e4;background:rgba(126,167,216,.16);border-radius:3px;
+  box-shadow:0 0 0 1px rgba(126,167,216,.16);}
+.mmh3-dtext{color:#e8eef6;}
+.mmh3-dtag{color:#e692c8;background:rgba(230,146,200,.14);border-radius:3px;
+  box-shadow:0 0 0 1px rgba(230,146,200,.28);
+  -webkit-box-decoration-break:clone;box-decoration-break:clone;}
+.mmh3-chippeek{position:fixed;z-index:10003;width:220px;background:#1e222a;
+  border:1px solid #3a4252;border-radius:9px;overflow:hidden;
+  box-shadow:0 16px 40px rgba(0,0,0,.55);pointer-events:none;}
+.mmh3-chippeekmedia{width:100%;max-height:150px;object-fit:contain;display:block;
+  background:#000;}
+.mmh3-chippeekcap{display:flex;align-items:center;gap:6px;padding:5px 8px;
+  font-size:calc(9px * var(--mmh3-fs, 1));color:#6b7484;}
+.mmh3-chippeekcap span:last-child{overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;}
+.mmh3-chippeekcap.col{flex-direction:column;align-items:flex-start;gap:4px;}
+.mmh3-chippeekcap.col span:last-child{overflow:visible;white-space:normal;}
+.mmh3-chiprow{display:flex;align-items:baseline;gap:5px;flex-wrap:wrap;}
+.mmh3-chiplabel{font-size:calc(9px * var(--mmh3-fs, 1));color:#6b7484;min-width:26px;}
+.mmh3-chipspk{font-size:calc(9px * var(--mmh3-fs, 1));color:#7ea7d8;font-family:ui-monospace,monospace;}
+.mmh3-chiptags{display:flex;flex-wrap:wrap;gap:3px;}
+.mmh3-chiptags .mmh3-tagname{font-size:calc(9px * var(--mmh3-fs, 1));}
+.mmh3-chipnone{color:#6b7484;font-style:italic;}
+/* ---- Draft mode ----
+   One class on the modal drives everything: teal chrome for the across-the-
+   room read, a cool field wash for mid-typing, and the banner carrying the
+   actual meaning. Teal is the one hue unclaimed elsewhere in the palette —
+   speaker blue, shot magenta and danger red all stay distinct — and unlike
+   a warm accent it doesn't go muddy at low luminance. Colors only, so the
+   chip mirror never notices. Last in the sheet on purpose. */
+.mmh3-modal.draft{border-color:#3fb2a8;
+  box-shadow:0 24px 64px rgba(0,0,0,.55), 0 0 0 1px #3fb2a8;}
+.mmh3-modal.draft .mmh3-head{background:#15242a;border-bottom-color:#3fb2a8;}
+.mmh3-modal.draft .mmh3-form textarea,
+.mmh3-modal.draft .mmh3-form input[type=text],
+.mmh3-modal.draft .mmh3-form input[type=number],
+.mmh3-modal.draft .mmh3-form select{background:#101619;border-color:#24343a;}
+/* Chip fields paint their background on the WRAP — textarea and mirror are
+   both transparent by design — so the wash has to land there. Backgrounds
+   and borders only: colors are layout-neutral, the mirror never notices. */
+.mmh3-modal.draft .mmh3-chipwrap{background:#101619;border-color:#24343a;}
+.mmh3-modal.draft .mmh3-chipwrap textarea.mmh3-chiptext{background:transparent;
+  border-color:transparent;}
+.mmh3-titletag{color:#3fb2a8;font-weight:600;margin-left:8px;
+  font-size:calc(13px * var(--mmh3-fs, 1));}
+.mmh3-modetoggle.draft{border-color:#3fb2a8;color:#6fd0c6;}
+.mmh3-draftadmin{display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+  padding:5px 6px;}
+.mmh3-drafthint{flex:1 1 140px;min-width:0;color:#8a93a3;
+  font-size:calc(10px * var(--mmh3-fs, 1));line-height:1.4;}
+.mmh3-draftslot{flex:0 0 auto;}
+.mmh3-draftslot:empty{display:none;}
+.mmh3-draftbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  background:#15242a;border-top:1px solid #3fb2a8;
+  border-bottom:1px solid #3fb2a8;padding:8px 16px;}
+.mmh3-draftbadge{background:#3fb2a8;color:#06211f;font-weight:700;
+  border-radius:5px;padding:1px 7px;letter-spacing:.06em;
+  font-size:calc(10px * var(--mmh3-fs, 1));}
+.mmh3-draftmsg{flex:1 1 240px;min-width:0;color:#bfe0dc;
+  font-size:calc(11px * var(--mmh3-fs, 1));line-height:1.45;}
+.mmh3-draftstatus{color:#3fb2a8;opacity:.75;}
+.mmh3-mediapeek{width:256px;padding:0;}
+.mmh3-peeklink{margin-top:5px;padding-top:5px;border-top:1px solid #262c36;
+  color:#8fd3c8;line-height:1.4;font-size:calc(10px * var(--mmh3-fs, 1));}
+.mmh3-peekgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:3px;
+  padding:6px;background:#12151b;}
+.mmh3-peekcell{position:relative;aspect-ratio:1;background:#0e1116;
+  border-radius:4px;overflow:hidden;display:flex;align-items:center;
+  justify-content:center;}
+.mmh3-peekcell img{width:100%;height:100%;object-fit:cover;}
+.mmh3-peekkind{color:#6b7484;display:flex;align-items:center;
+  justify-content:center;}
+.mmh3-peekkind .mmh3-kindicon{width:22px;height:22px;color:#6b7484;}
+.mmh3-peekname{position:absolute;left:0;right:0;bottom:0;padding:1px 3px;
+  background:rgba(8,10,14,.72);color:#9aa3b2;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;
+  font-size:calc(8px * var(--mmh3-fs, 1));}
+.mmh3-libmedia{display:inline-flex;align-items:baseline;gap:5px;
+  font-size:calc(10px * var(--mmh3-fs, 1));color:#8fd3c8;
+  background:rgba(63,178,168,.14);border:1px solid rgba(63,178,168,.32);
+  border-radius:5px;padding:1px 7px;max-width:260px;overflow:hidden;
+  white-space:nowrap;cursor:help;}
+.mmh3-libmedia:hover{background:rgba(63,178,168,.22);}
+.mmh3-libkind{color:#8fd3c8;flex:0 0 auto;display:inline-flex;
+  align-items:baseline;gap:2px;}
+.mmh3-kindicon{width:1.05em;height:1.05em;display:block;flex:0 0 auto;
+  color:#5e9c93;}
+.mmh3-libkind{gap:3px;}
+.mmh3-libsep{color:#4a7a73;flex:0 0 auto;}
+.mmh3-libpname{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.mmh3-prefitem.off{opacity:.5;}
+.mmh3-prefitem.off .mmh3-prefhint{color:#f0c98a;opacity:.85;}
+.mmh3-linkrow{display:flex;align-items:flex-start;gap:7px;flex-wrap:wrap;
+  margin-top:7px;padding-top:7px;border-top:1px solid #262c36;}
+.mmh3-linktext{display:flex;flex-direction:column;gap:1px;
+  font-size:calc(11px * var(--mmh3-fs, 1));color:#8a93a3;}
+.mmh3-linktext b{color:#6fb3a8;font-weight:600;}
+.mmh3-linknote{color:#6b7484;font-size:calc(10px * var(--mmh3-fs, 1));
+  line-height:1.4;}
+.mmh3-linkname{flex:1 1 140px;min-width:0;background:#12151b;color:#dde2ea;
+  border:1px solid #2e3440;border-radius:6px;padding:4px 8px;
+  font-size:calc(11px * var(--mmh3-fs, 1));font-family:inherit;}
+.mmh3-linkname:focus{outline:none;border-color:#4a5568;}
+.mmh3-linkwarn{display:block;margin-top:5px;color:#f0c98a;}
+.mmh3-draftdropped{background:#3a2a18;color:#f0c98a;border:1px solid #6b4f26;
+  border-radius:5px;padding:1px 7px;flex:0 0 auto;cursor:help;
+  font-size:calc(10px * var(--mmh3-fs, 1));}
+.mmh3-draftactions{display:flex;gap:6px;flex:0 0 auto;}
+.mmh3-commitstrip{background:#132126;border-top:1px solid #3fb2a8;
+  border-bottom:1px solid #3fb2a8;padding:10px 16px;}
+.mmh3-commitmsg{display:block;color:#bfe0dc;margin-bottom:7px;
+  font-size:calc(12px * var(--mmh3-fs, 1));line-height:1.45;}
+.mmh3-commitrow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;}
+.mmh3-commitname{flex:1 1 180px;min-width:0;background:#12151b;
+  color:#dde2ea;border:1px solid #2e3440;border-radius:6px;padding:5px 8px;
+  font-size:calc(12px * var(--mmh3-fs, 1));font-family:inherit;}
+.mmh3-commitname:focus{outline:none;border-color:#4a5568;}
+`;
+
+let cssInjected = false;
+function injectCSS() {
+  if (cssInjected) return;
+  document.head.append(el("style", { textContent: CSS }));
+  cssInjected = true;
+}
+
+function toast(msg, ms = 1800) {
+  const t = el("div", { class: "mmh3-toast" }, msg);
+  if (ms > 4000) t.classList.add("bad");
+  document.body.append(t);
+  setTimeout(() => t.remove(), ms);
+}
+
+/* ------------------------------------------------------------------ */
+/* Prompt library                                                      */
+/* ------------------------------------------------------------------ */
+
+/* ---------- drafts ----------
+ * Draft mode's scratchpad. Lives on disk (one keyed file, server-side), so
+ * a browser crash loses at most a debounce window. Live is the node; the
+ * draft is the file; nothing here ever touches the prompt library or the
+ * preset store except through the user's own explicit save. */
+
+async function draftApi(path, body) {
+  const resp = await postApi("/minimax_h3/drafts" + path, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `request failed (${resp.status})`);
+  return data;
+}
+
+/** Stable serialisation: object key order must not read as "changed". */
+function stableStringify(v) {
+  if (Array.isArray(v)) return "[" + v.map(stableStringify).join(",") + "]";
+  if (v && typeof v === "object") {
+    return "{" + Object.keys(v).sort().map(
+      (k) => JSON.stringify(k) + ":" + stableStringify(v[k])).join(",") + "}";
+  }
+  return JSON.stringify(v);
+}
+
+/** djb2 — cheap content fingerprint for clean/dirty comparisons. Cleanliness
+ *  is always computed from this, never stored as a flag: stored booleans
+ *  drift out of sync, a comparison can't. */
+function hashStr(s) {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+
+function stateHash(state) { return hashStr(stableStringify(state)); }
+
+const DRAFT_MEDIA_KINDS = new Set(["picture", "video", "audio"]);
+
+/** Validate a media array that came from disk.
+ *
+ *  This is the only path that writes to the loader's media_state without
+ *  having gone through upload/probe first — commit deep-copies the draft's
+ *  set straight in, and that widget is what nodes.py reads at execution.
+ *  So a malformed item here doesn't just look wrong, it reaches Python.
+ *
+ *  Unknown keys are deliberately KEPT: a newer build may add fields, and
+ *  stripping them would make an older build silently lossy. Returns
+ *  { items, dropped } — the caller must surface `dropped`, because a draft
+ *  quietly losing a reference is the failure this exists to prevent. */
+function validateDraftMedia(raw) {
+  if (!Array.isArray(raw)) return { items: null, dropped: 0 };
+  const seen = new Set();
+  let dropped = 0;
+  const items = [];
+  for (const it of raw) {
+    if (!it || typeof it !== "object" || Array.isArray(it)) { dropped++; continue; }
+    if (!DRAFT_MEDIA_KINDS.has(it.kind)) { dropped++; continue; }
+    if (typeof it.file !== "string" || !it.file.trim()) { dropped++; continue; }
+    const out = { ...it };
+    out.file = it.file.trim();
+    if (typeof out.name !== "string" || !out.name.trim()) {
+      // Fall back to the filename rather than rendering "undefined".
+      out.name = parseAnnotatedPath(out.file).name || out.file;
+    }
+    // live() matches on uid, so a collision lands edits on the wrong item.
+    if (typeof out.uid !== "string" || !out.uid || seen.has(out.uid)) {
+      out.uid = `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+    }
+    seen.add(out.uid);
+    items.push(out);
+  }
+  return { items: items.length ? items : null, dropped };
+}
+
+/** RefMod picks a draft stored — from disk, so unvalidated. Keeps what the
+ *  stack panel can show: a name and at least one channel with a file. */
+function validateDraftRefmods(raw) {
+  if (!Array.isArray(raw)) return { items: null, dropped: 0 };
+  let dropped = 0;
+  const items = [];
+  for (const p of raw) {
+    if (!p || typeof p !== "object" || Array.isArray(p)) { dropped++; continue; }
+    const chan = (c) => (c && typeof c === "object" && typeof c.file === "string" && c.file.trim()) ? { ...c } : null;
+    const visual = chan(p.visual), audio = chan(p.audio);
+    if (!visual && !audio) { dropped++; continue; }
+    const out = { ...p, visual: visual || undefined, audio: audio || undefined };
+    if (typeof out.name !== "string" || !out.name.trim()) out.name = (visual || audio).file;
+    if (typeof out.label !== "string" || !out.label.trim()) out.label = out.name.split("/").pop();
+    items.push(out);
+  }
+  return { items: items.length ? items : null, dropped };
+}
+
+/** The node's draft identity. Properties serialise by NAME in the workflow
+ *  file — unlike widgets, which are positional — so this adds no widget and
+ *  can't shift saved-graph value mapping. Minted once, travels with the
+ *  workflow through save/export/import. */
+function draftIdFor(node) {
+  node.properties = node.properties || {};
+  if (!node.properties.mmh3_draft_id) {
+    node.properties.mmh3_draft_id = "d" + Date.now().toString(36) +
+      Math.random().toString(36).slice(2, 8);
+  }
+  return node.properties.mmh3_draft_id;
+}
+
+/** RefMod presets: a saved stack, kept by the same routes shape. */
+async function refmodPresetApi(path, body) {
+  const resp = await postApi("/minimax_h3/refmod_presets" + path, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `request failed (${resp.status})`);
+  return data;
+}
+
+async function presetApi(path, body) {
+  const resp = await postApi("/minimax_h3/presets" + path, {
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.error || `request failed (${resp.status})`);
+  return data;
+}
+
+async function libApi(path, body) {
+  const resp = body
+    ? await postApi("/minimax_h3/prompts" + path, {
+        body: JSON.stringify(body),
+        headers: { "Content-Type": "application/json" } })
+    : await api.fetchApi("/minimax_h3/prompts" + path);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const err = new Error(data.error || `request failed (${resp.status})`);
+    if (data.exists) err.exists = true;   // 409: name collision on a new save
+    throw err;
+  }
+  return data;
+}
+
+function ago(ts) {
+  if (!ts) return "";
+  const secs = Math.max(0, Date.now() / 1000 - ts);
+  const steps = [[86400 * 365, "y"], [86400 * 30, "mo"], [86400, "d"],
+                 [3600, "h"], [60, "m"]];
+  for (const [size, unit] of steps)
+    if (secs >= size) return `${Math.floor(secs / size)}${unit} ago`;
+  return "just now";
+}
+
+/** Browse, filter, and load saved prompts. `onLoad` receives the saved state. */
+class Library {
+  static _peekCache = new Map();
+
+  constructor(editor) {
+    this.editor = editor;
+    this.entries = [];
+    this.categories = [];
+    this.query = "";
+    this.category = "";
+    this.favesOnly = false;
+    this.saveOpen = false;
+    this.catEdit = false;     // renaming the selected category
+    this.rowCat = null;       // id of the entry whose category is being set
+    this.pending = null;      // { id, action: "load" | "delete" }
+    this.formId = `mmh3cat${Math.random().toString(36).slice(2, 8)}`;
+    injectCSS();
+    this.build();
+    document.body.append(this.overlay);
+    this.refresh();
+  }
+
+  build() {
+    this.listEl = el("div", { class: "mmh3-liblist" });
+    this.searchEl = el("input", {
+      type: "text", placeholder: "Search prompts",
+      oninput: (e) => { this.query = e.target.value.toLowerCase(); this.paint(); },
+    });
+    this.catEl = el("select", {
+      onchange: (e) => { this.category = e.target.value; this.paint(); },
+    });
+    this.favEl = el("button", { class: "mmh3-btn",
+      title: "Show favourites only",
+      onclick: () => { this.favesOnly = !this.favesOnly; this.paint(); } },
+      "\u2605 Favourites");
+
+    this.catBtn = el("button", { class: "mmh3-btn",
+      title: "Rename or clear the selected category",
+      onclick: () => {
+        if (!this.category) { toast("Pick a category to manage first"); return; }
+        this.catEdit = !this.catEdit;
+        this.paint();
+      } }, "\u270e");
+
+    // Same reasoning as the editor: a stray click shouldn't discard a
+    // half-filled save form. Use \u2715, Cancel or Escape.
+    this.overlay = el("div", { class: "mmh3-overlay mmh3-libover" },
+      el("div", { class: "mmh3-libmodal" },
+        el("div", { class: "mmh3-head" },
+          el("div", { class: "mmh3-title" }, "Prompt library"),
+          el("button", { class: "mmh3-btn",
+            onclick: () => { this.saveOpen = !this.saveOpen; this.paint(); } },
+            "Save current prompt"),
+          el("button", { class: "mmh3-x", onclick: () => this.close() }, "\u2715")),
+        el("div", { class: "mmh3-libbar" },
+          this.searchEl, this.catEl, this.catBtn, this.favEl),
+        this.listEl));
+
+    // Both overlays listen on window, and this one registered first — so
+    // without this guard Escape closed the editor out from under whatever
+    // was stacked on top of it.
+    this.escHandler = (e) => {
+      if (e.key !== "Escape") return;
+      // A window opened from here owns Escape: the Media Loader, the RefMod
+      // Stack or library, or a crop editor.
+      if (document.querySelector(".mml-overlay, .mmr-overlay, .mml-tmover")) return;
+      this.close();
+    };
+    window.addEventListener("keydown", this.escHandler);
+  }
+
+  close() {
+    window.removeEventListener("keydown", this.escHandler);
+    // The peek lives on <body>, so it would outlive the modal that owns it.
+    this.closeMediaPeek();
+    this.overlay.remove();
+  }
+
+  async refresh() {
+    try {
+      const data = await libApi("");
+      this.entries = data.prompts || [];
+      this.categories = data.categories || [];
+    } catch (err) {
+      this.entries = [];
+      this.listEl.replaceChildren(
+        el("div", { class: "mmh3-libempty" },
+          `Library unavailable: ${err.message}. Restart ComfyUI if you just updated.`));
+      return;
+    }
+    // A filter pointing at a category that no longer exists (its last prompt
+    // deleted, renamed away, or lost to a save elsewhere) showed an empty
+    // list under a dropdown reading "All categories" — the classic
+    // "my prompts are missing" report. Reset the filter instead.
+    if (this.category && !this.categories.includes(this.category)) {
+      this.category = "";
+      this.catEdit = false;
+    }
+    this.catEl.replaceChildren(
+      el("option", { value: "" }, "All categories"),
+      ...this.categories.map((c) =>
+        el("option", { value: c, selected: c === this.category }, c)));
+    this.catEl.value = this.category;   // displayed value === active filter, always
+    this.paint();
+  }
+
+  visible() {
+    return this.entries.filter((e) => {
+      if (this.favesOnly && !e.favorite) return false;
+      if (this.category && e.category !== this.category) return false;
+      if (!this.query) return true;
+      return [e.name, e.category, e.mode, e.preview].join(" ")
+        .toLowerCase().includes(this.query);
+    });
+  }
+
+  saveForm() {
+    const ed = this.editor;
+    const name = el("input", { type: "text", placeholder: "Prompt name",
+      value: ed.libraryName || `${ed.state.mode} prompt` });
+    // Existing categories as a list, so saving into one is a pick rather
+    // than retyping it exactly; "(new category…)" reveals a text field.
+    const known = [...this.categories];
+    const current = ed.libraryCategory || "";
+    if (current && !known.includes(current)) known.unshift(current);
+    const catNew = el("input", { type: "text", placeholder: "New category name",
+      style: { display: "none" } });
+    const category = el("select", { class: "mmh3-savecat",
+      onchange: () => {
+        const isNew = category.value === "\u0000new";
+        catNew.style.display = isNew ? "" : "none";
+        if (isNew) setTimeout(() => catNew.focus(), 0);
+      } },
+      el("option", { value: "" }, "No category"),
+      known.map((c) => el("option",
+        { value: c, selected: c === current }, c)),
+      el("option", { value: "\u0000new" }, "(new category\u2026)"));
+    const categoryValue = () =>
+      (category.value === "\u0000new" ? catNew.value : category.value).trim();
+    const fav = el("input", { type: "checkbox" });
+    const err = el("span", { class: "mmh3-saveerr" });
+
+    // Media link. Which of the three states applies is decided by CONTENT,
+    // not by the loader's presetName: that label survives every edit short
+    // of Unload, so it happily claims "beach set" for media that stopped
+    // matching it an hour ago.
+    const linkBox = el("input", { type: "checkbox" });
+    const linkNew = el("input", { type: "text", class: "mmh3-linkname",
+      placeholder: "new preset name\u2026" });
+    const linkRow = el("label", { class: "mmh3-linkrow" },
+      el("span", { class: "mmh3-linktext" }, "checking media\u2026"));
+    const link = { mode: "none", preset: null, digest: null, items: null };
+
+    (async () => {
+      const items = loaderItems(ed.node) || [];
+      if (!items.length) { linkRow.style.display = "none"; return; }
+      let match;
+      try { match = await presetApi("/match", { items }); }
+      catch (e2) { linkRow.style.display = "none"; return; }
+      link.items = items;
+      link.digest = match.digest;
+      const count = `${items.length} reference` +
+        `${items.length === 1 ? "" : "s"}`;
+      if (match.name) {
+        link.mode = "existing";
+        link.preset = match.name;
+        linkBox.checked = true;
+        linkRow.replaceChildren(linkBox,
+          el("span", { class: "mmh3-linktext" },
+            el("b", {}, "Linked to media \u2014 " + match.name),
+            el("span", { class: "mmh3-linknote" },
+              `The loaded media (${count}) is saved as this preset. ` +
+              "Loading this prompt will offer to load it too.")));
+      } else {
+        link.mode = "new";
+        linkNew.value = (name.value || "").trim();
+        linkRow.replaceChildren(linkBox,
+          el("span", { class: "mmh3-linktext" },
+            el("b", {}, "Link to media \u2014 new preset"),
+            el("span", { class: "mmh3-linknote" },
+              `The loaded media (${count}) isn't saved as a preset yet. ` +
+              "Name it and it will be saved and linked to this prompt.")),
+          linkNew);
+      }
+    })();
+
+    // RefMod link, the same way: decided by what the stack holds (or the
+    // draft's own picks), matched against the saved RefMod presets.
+    const rlinkBox = el("input", { type: "checkbox" });
+    const rlinkNew = el("input", { type: "text", class: "mmh3-linkname",
+      placeholder: "new preset name\u2026" });
+    const rlinkRow = el("label", { class: "mmh3-linkrow" },
+      el("span", { class: "mmh3-linktext" }, "checking RefMods\u2026"));
+    const rlink = { mode: "none", preset: null, digest: null, picks: null };
+
+    (async () => {
+      let picks = [];
+      try {
+        if (ed.bufferMode === "draft") picks = ed.draftRefmodsView() || [];
+        else { const { stack } = refmodStackFor(ed.node); picks = stack ? readStack(stack).picks : []; }
+      } catch (e2) { picks = []; }
+      const live = picks.filter((p) => p && p.on !== false);
+      if (!live.length) { rlinkRow.style.display = "none"; return; }
+      let match;
+      try { match = await refmodPresetApi("/match", { picks }); }
+      catch (e2) { rlinkRow.style.display = "none"; return; }
+      rlink.picks = picks;
+      rlink.digest = match.digest;
+      const count = `${live.length} RefMod${live.length === 1 ? "" : "s"}`;
+      if (match.name) {
+        rlink.mode = "existing";
+        rlink.preset = match.name;
+        rlinkBox.checked = true;
+        rlinkRow.replaceChildren(rlinkBox,
+          el("span", { class: "mmh3-linktext" },
+            el("b", {}, "Linked to RefMods \u2014 " + match.name),
+            el("span", { class: "mmh3-linknote" },
+              `The stack (${count}, with weights) is saved as this preset. ` +
+              "Loading this prompt will offer to load it too.")));
+      } else {
+        rlink.mode = "new";
+        rlinkNew.value = (name.value || "").trim();
+        rlinkRow.replaceChildren(rlinkBox,
+          el("span", { class: "mmh3-linktext" },
+            el("b", {}, "Link to RefMods \u2014 new preset"),
+            el("span", { class: "mmh3-linknote" },
+              `The stack (${count}, with weights) isn't saved as a preset yet. ` +
+              "Name it and it will be saved and linked to this prompt.")),
+          rlinkNew);
+      }
+    })();
+
+    /** Returns the link fields for the save body — media_preset and
+     *  refmod_preset with their digests — creating a preset first when the
+     *  user asked for a new one. */
+    const resolveLink = async () => {
+      const out = {};
+      if (linkBox.checked && link.mode !== "none") {
+        if (link.mode === "existing") {
+          out.media_preset = link.preset; out.media_digest = link.digest;
+        } else {
+          const pname = linkNew.value.trim();
+          if (!pname) throw new Error("Give the media preset a name, or untick it.");
+          const res = await presetApi("/save", { name: pname, items: link.items });
+          out.media_preset = res.name; out.media_digest = link.digest;
+        }
+      }
+      if (rlinkBox.checked && rlink.mode !== "none") {
+        if (rlink.mode === "existing") {
+          out.refmod_preset = rlink.preset; out.refmod_digest = rlink.digest;
+        } else {
+          const pname = rlinkNew.value.trim();
+          if (!pname) throw new Error("Give the RefMod preset a name, or untick it.");
+          const res = await refmodPresetApi("/save", { name: pname, picks: rlink.picks });
+          out.refmod_preset = res.name; out.refmod_digest = res.digest || rlink.digest;
+        }
+      }
+      return out;
+    };
+
+    // Saving under a different name used to be treated as a rename, which
+    // DELETED the loaded prompt — "save a variant" quietly ate the original.
+    // The ambiguity is now the user's call: "Save as new" never deletes, and
+    // renaming is its own, clearly-labelled button.
+    const doSave = async ({ rename = false, overwrite = false } = {}) => {
+      const value = name.value.trim();
+      if (!value) { err.textContent = "Give it a name first."; name.focus(); return; }
+      const inPlace = ed.libraryId && value === ed.libraryName;
+      let linkFields;
+      try { linkFields = await resolveLink(); }
+      catch (e3) { err.textContent = e3.message; return; }
+      const body = {
+        name: value,
+        category: categoryValue(),
+        favorite: fav.checked,
+        mode: ed.state.mode,
+        refs: ed.slots.filter((s) => s.tag).length,
+        prompt: generate(ed.state),
+        state: ed.state,
+        ...linkFields,
+      };
+      if (rename) { body.rename_from = ed.libraryId; body.rename = true; }
+      else if (!inPlace && !overwrite) body.expect_new = true;
+      try {
+        const res = await libApi("/save", body);
+        ed.libraryId = res.id;
+        ed.libraryName = res.name;
+        ed.libraryCategory = categoryValue();
+        ed.noteLibraryIdentity();
+        this.saveOpen = false;
+        toast(`Saved "${res.name}"`);
+        this.refresh();
+      } catch (e2) {
+        if (e2.exists) {
+          // Name collision on a new save: confirm inline, never silently.
+          err.replaceChildren(
+            `A prompt named "${value}" already exists. `,
+            el("button", { class: "mmh3-btn",
+              onclick: () => doSave({ overwrite: true }) },
+              "Overwrite it"));
+        } else err.textContent = e2.message;
+      }
+    };
+
+    const saveBtn = el("button", { class: "mmh3-btn primary",
+      onclick: () => doSave() }, "Save");
+    const renameBtn = el("button", { class: "mmh3-btn ghost",
+      style: { display: "none" },
+      onclick: () => doSave({ rename: true }) }, "");
+    const syncButtons = () => {
+      const value = name.value.trim();
+      const renaming = ed.libraryId && ed.libraryName
+        && value && value !== ed.libraryName;
+      saveBtn.textContent = renaming ? "Save as new" : "Save";
+      renameBtn.style.display = renaming ? "" : "none";
+      if (renaming) {
+        renameBtn.textContent = `Rename "${ed.libraryName}"`;
+        renameBtn.title = `"${ed.libraryName}" becomes "${value}" — ` +
+          "no second copy is kept";
+      }
+      err.textContent = "";        // typing resets a stale collision notice
+    };
+    name.addEventListener("input", syncButtons);
+    syncButtons();
+
+    name.addEventListener("keydown", (e) => { if (e.key === "Enter") doSave(); });
+    catNew.addEventListener("keydown", (e) => { if (e.key === "Enter") doSave(); });
+    setTimeout(() => { name.focus(); name.select(); }, 0);
+
+    return el("div", { class: "mmh3-saveform" },
+      el("div", { class: "mmh3-saverow" },
+        name, category, catNew,
+        el("label", { class: "mmh3-savefav" }, fav, "favourite"),
+        saveBtn, renameBtn,
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.saveOpen = false; this.paint(); } }, "Cancel")),
+      linkRow,
+      rlinkRow,
+      err);
+  }
+
+  confirmRow(entry, action) {
+    const isDelete = action === "delete";
+    return el("div", { class: "mmh3-librow confirm" },
+      el("div", { class: "mmh3-libmain" },
+        el("div", { class: "mmh3-libtop" },
+          el("span", { class: "mmh3-libname" },
+            isDelete
+              ? `Delete "${entry.name}"?`
+              : `Replace the editor with "${entry.name}"?`)),
+        el("div", { class: "mmh3-libprev" },
+          isDelete
+            ? "This removes the saved prompt. It cannot be undone."
+            : "Your unsaved changes in the editor will be lost.")),
+      el("div", { class: "mmh3-libacts" },
+        el("button", { class: "mmh3-btn primary",
+          onclick: () => isDelete ? this.remove(entry) : this.load(entry) },
+          isDelete ? "Delete" : "Load"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.pending = null; this.paint(); } }, "Cancel")));
+  }
+
+  categoryForm() {
+    const input = el("input", { type: "text", value: this.category,
+      placeholder: "New category name" });
+    const count = this.entries.filter((e) => e.category === this.category).length;
+    const err = el("span", { class: "mmh3-saveerr" });
+
+    const apply = async (target) => {
+      try {
+        const res = await libApi("/category", { from: this.category, to: target });
+        toast(target
+          ? `Moved ${res.changed} prompt${res.changed === 1 ? "" : "s"} to "${target}"`
+          : `Cleared the category on ${res.changed} prompt${res.changed === 1 ? "" : "s"}`);
+        this.category = target;
+        this.catEdit = false;
+        this.refresh();
+      } catch (e2) { err.textContent = e2.message; }
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") apply(input.value.trim());
+    });
+    setTimeout(() => { input.focus(); input.select(); }, 0);
+
+    return el("div", { class: "mmh3-saveform" },
+      el("div", { class: "mmh3-saverow" },
+        el("span", { class: "mmh3-catlbl" },
+          `"${this.category}" \u2014 ${count} prompt${count === 1 ? "" : "s"}`),
+        input,
+        el("button", { class: "mmh3-btn primary",
+          onclick: () => apply(input.value.trim()) }, "Rename"),
+        el("button", { class: "mmh3-btn ghost",
+          title: "Remove this category from its prompts (they are kept)",
+          onclick: () => apply("") }, "Clear"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.catEdit = false; this.paint(); } }, "Cancel")),
+      err);
+  }
+
+  rowCategoryForm(entry) {
+    const input = el("input", { type: "text", value: entry.category || "",
+      list: this.formId, placeholder: "Category (blank to clear)" });
+    const apply = async () => {
+      try {
+        const res = await libApi("/meta",
+          { id: entry.id, category: input.value.trim() });
+        entry.category = res.category;
+        this.rowCat = null;
+        this.refresh();
+      } catch (e2) { toast(e2.message); }
+    };
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") apply(); });
+    setTimeout(() => { input.focus(); input.select(); }, 0);
+    return el("div", { class: "mmh3-librow confirm" },
+      el("div", { class: "mmh3-libmain" },
+        el("div", { class: "mmh3-libtop" },
+          el("span", { class: "mmh3-libname" }, entry.name)),
+        el("div", { class: "mmh3-saverow", style: { marginTop: "4px" } },
+          input,
+          el("datalist", { id: this.formId },
+            this.categories.map((c) => el("option", { value: c }))))),
+      el("div", { class: "mmh3-libacts" },
+        el("button", { class: "mmh3-btn primary", onclick: apply }, "Set"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.rowCat = null; this.paint(); } }, "Cancel")));
+  }
+
+  paint() {
+    this.favEl.classList.toggle("on", this.favesOnly);
+    const rows = this.visible();
+    const kids = [];
+    if (this.saveOpen) kids.push(this.saveForm());
+    if (this.catEdit && this.category) kids.push(this.categoryForm());
+    if (!rows.length) {
+      kids.push(el("div", { class: "mmh3-libempty" },
+        this.entries.length
+          ? "Nothing matches those filters."
+          : "No saved prompts yet \u2014 use 'Save current prompt'."));
+      this.listEl.replaceChildren(...kids);
+      return;
+    }
+    kids.push(...rows.map((e) => this.rowCat === e.id
+      ? this.rowCategoryForm(e)
+      : this.pending?.id === e.id
+      ? this.confirmRow(e, this.pending.action)
+      : el("div", { class: "mmh3-librow" },
+      el("button", {
+        class: "mmh3-star" + (e.favorite ? " on" : ""),
+        title: e.favorite ? "Remove from favourites" : "Add to favourites",
+        onclick: async () => {
+          try {
+            await libApi("/meta", { id: e.id, favorite: !e.favorite });
+            e.favorite = !e.favorite;
+            this.paint();
+          } catch (err) { toast(err.message); }
+        } }, e.favorite ? "\u2605" : "\u2606"),
+      el("div", { class: "mmh3-libmain" },
+        el("div", { class: "mmh3-libtop" },
+          el("span", { class: "mmh3-libname" }, e.name),
+          e.mode ? el("span", { class: "mmh3-libmode" },
+            e.mode === "REF" ? "reference" : e.mode) : null,
+          el("span", { class: "mmh3-libcat" + (e.category ? "" : " none"),
+          title: "Change this prompt's category",
+          onclick: () => { this.rowCat = e.id; this.paint(); } },
+          e.category || "+ category"),
+          e.media_preset
+            ? this.mediaBadge(e.media_preset, e.media_counts)
+            : null,
+          e.refmod_preset
+            ? el("span", { class: "mmh3-libmedia", title: "Linked RefMod preset: loading this prompt offers to load it too" },
+                el("span", { class: "mmh3-libkind" }, "\u25c8", e.refmod_count != null ? String(e.refmod_count) : ""),
+                el("span", { class: "mmh3-libsep" }, "\u00b7"),
+                el("span", { class: "mmh3-libpname" }, e.refmod_preset))
+            : null,
+          el("span", { class: "mmh3-libage" }, ago(e.updated))),
+        el("div", { class: "mmh3-libprev" }, e.preview || "(empty)")),
+      el("div", { class: "mmh3-libacts" },
+        el("button", { class: "mmh3-btn primary",
+          onclick: () => this.askLoad(e) }, "Load"),
+        el("button", { class: "mmh3-btn ghost", title: "Delete",
+          onclick: () => { this.pending = { id: e.id, action: "delete" };
+            this.paint(); } }, "\u2715")))));
+    this.listEl.replaceChildren(...kids);
+  }
+
+  askLoad(entry) {
+    // Only worth confirming if there is something to lose.
+    if (generate(this.editor.state).trim()) {
+      this.pending = { id: entry.id, action: "load" };
+      this.paint();
+    } else this.load(entry);
+  }
+
+  async load(entry) {
+    this.pending = null;
+    try {
+      const data = await libApi("/load", { id: entry.id });
+      const base = defaultState();
+      const next = { ...base, ...(data.state || {}),
+        ref: { ...base.ref, ...((data.state || {}).ref || {}) } };
+      this.editor.state = next;
+      this.editor.libraryId = entry.id;
+      this.editor.libraryName = entry.name;
+      this.editor.libraryCategory = data.category || "";
+      // Loading = clean against that entry; the active buffer records it.
+      this.editor.noteLibraryIdentity();
+      if (data.media_preset) {
+        this.editor.offerLinkedMedia(data.media_preset, data.media_digest);
+      }
+      if (data.refmod_preset) {
+        this.editor.offerLinkedRefmods(data.refmod_preset, data.refmod_digest);
+      }
+      this.editor.render();
+      toast(`Loaded "${entry.name}"`);
+      this.close();
+    } catch (err) { toast(`Load failed: ${err.message}`); }
+  }
+
+  /** The linked-preset badge, with a hover preview of what it holds.
+   *
+   *  The contents are fetched once per preset per session and cached: the
+   *  route probes files it hasn't got metadata for, and a hover shouldn't
+   *  pay that twice. Everything here is read-only — a failed fetch just
+   *  means no preview, never a broken row. */
+  mediaBadge(presetName, counts) {
+    const badge = el("span", { class: "mmh3-libmedia" });
+    // Kind counts instead of a label: they say "this is media" AND what
+    // media, in the same space. Zero kinds are omitted, so an all-pictures
+    // set reads "3 pictures" rather than padding with empty categories.
+    // Glyphs match the rest of the pack — the loader already counts audio
+    // with the same note, and the media peek marks video with the same
+    // play mark.
+    if (counts) {
+      for (const k of ["picture", "video", "audio"]) {
+        if (!counts[k]) continue;
+        badge.append(el("span", { class: "mmh3-libkind" },
+          kindIcon(k), String(counts[k])));
+      }
+      if (badge.childElementCount) {
+        badge.append(el("span", { class: "mmh3-libsep" }, "\u00b7"));
+      }
+    }
+    badge.append(el("span", { class: "mmh3-libpname" }, presetName));
+    // Deliberately no title attribute anywhere on this badge: the OS
+    // tooltip appears over the preview and hides the thing you hovered for.
+    // The preview says it all instead.
+    let timer = null;
+    const open = async () => {
+      let info = Library._peekCache.get(presetName);
+      if (!info) {
+        try {
+          info = await presetApi("/load", { name: presetName });
+        } catch (e) {
+          info = { missing: null };          // remember the failure too
+        }
+        Library._peekCache.set(presetName, info);
+      }
+      if (!badge.isConnected || badge !== this._peekBadge) return;
+      this.closeMediaPeek();
+      const box = el("div", { class: "mmh3-peek mmh3-mediapeek" });
+      if (info.missing === null) {
+        box.append(el("div", { class: "mmh3-peekmeta" },
+          el("div", { class: "mmh3-peeksrc" },
+            `\u201c${presetName}\u201d couldn't be read \u2014 it may have ` +
+            "been deleted since this prompt was saved.")));
+      } else {
+        const items = info.items || [];
+        const grid = el("div", { class: "mmh3-peekgrid" });
+        items.slice(0, 9).forEach((it) => {
+          const url = loaderViewURL(it.file);
+          grid.append(el("div", { class: "mmh3-peekcell" },
+            it.kind === "picture"
+              ? el("img", { src: url, loading: "lazy" })
+              : el("span", { class: "mmh3-peekkind" }, kindIcon(it.kind)),
+            el("span", { class: "mmh3-peekname" }, it.name || it.file)));
+        });
+        const counts = ["picture", "video", "audio"].map((k) => {
+          const n = items.filter((i) => i.kind === k).length;
+          return n ? `${n} ${k}${n === 1 ? "" : "s"}` : null;
+        }).filter(Boolean).join(" \u00b7 ");
+        box.append(grid,
+          el("div", { class: "mmh3-peekmeta" },
+            el("div", { class: "mmh3-peekrow" },
+              el("span", { class: "mmh3-libmedia" },
+                el("span", { class: "mmh3-libpname" }, presetName)),
+              el("span", { class: "mmh3-peekcite" },
+                counts || "empty")),
+            info.category
+              ? el("div", { class: "mmh3-peeksrc" },
+                  "Category: " + info.category)
+              : null,
+            items.length > 9
+              ? el("div", { class: "mmh3-peeksrc" },
+                  `\u2026 and ${items.length - 9} more`)
+              : null,
+            (info.missing || []).length
+              ? el("div", { class: "mmh3-peeksrc" },
+                  `\u26a0 ${info.missing.length} file(s) missing`)
+              : null,
+            el("div", { class: "mmh3-peeklink" },
+              "Linked \u2014 loading this prompt offers to load this media.")));
+      }
+      const r = badge.getBoundingClientRect();
+      box.style.left = `${Math.max(8,
+        Math.min(r.left, window.innerWidth - 268))}px`;
+      // Flip above when there isn't room below, so it never runs off-screen.
+      const below = window.innerHeight - r.bottom;
+      if (below < 220) box.style.bottom = `${window.innerHeight - r.top + 6}px`;
+      else box.style.top = `${r.bottom + 6}px`;
+      box.addEventListener("mouseenter", () => clearTimeout(this._mpClose));
+      box.addEventListener("mouseleave", () => this.closeMediaPeek());
+      document.body.append(box);
+      this._mediaPeek = box;
+    };
+    badge.addEventListener("mouseenter", () => {
+      this._peekBadge = badge;
+      timer = setTimeout(open, 320);
+    });
+    badge.addEventListener("mouseleave", () => {
+      clearTimeout(timer);
+      this._peekBadge = null;
+      this._mpClose = setTimeout(() => this.closeMediaPeek(), 180);
+    });
+    return badge;
+  }
+
+  closeMediaPeek() {
+    clearTimeout(this._mpClose);
+    this._mediaPeek?.remove();
+    this._mediaPeek = null;
+  }
+
+  async remove(entry) {
+    this.pending = null;
+    try {
+      await libApi("/delete", { id: entry.id });
+      this.entries = this.entries.filter((x) => x !== entry);
+      this.paint();          // the row disappears immediately…
+      this.refresh();        // …and the category list follows the server
+    } catch (err) { toast(`Delete failed: ${err.message}`); }
+  }
+
+}
+
+/* ------------------------------------------------------------------ */
+/* Modal editor                                                        */
+/* ------------------------------------------------------------------ */
+
+class Editor {
+  constructor(node) {
+    this.node = node;
+    this.state = loadState(node);
+    this.slots = getRefSlots(node);
+    this.lastFocus = null;
+    this.pins = [];
+    this.autoPin = null;
+    this.libraryId = null;
+    this.libraryName = "";
+    this.libraryCategory = "";
+    this.clearPending = false;
+    this.closePending = false;
+    this.prefs = loadPrefs();
+    setNamePrefix(this.prefs.namePrefix);
+    this.prefsOpen = false;
+    // Draft mode. "live" edits the node's prompt as ever; "draft" edits a
+    // disk-backed scratch buffer that is never queued or executed. The two
+    // buffers swap wholesale — state, library identity, session baseline —
+    // so neither can bleed into the other.
+    this.bufferMode = "live";
+    this.draftEntry = null;          // the disk entry, once fetched
+    this.commitPending = false;      // commit decision strip showing
+    this.pullPending = false;        // pull-from-Live choice strip showing
+    this.linkOffer = null;           // linked media preset awaiting a yes/no
+    this.draftStale = false;         // media snapshot diverged from loader
+    this._liveHeld = null;           // live session edits parked during draft
+    // What the node currently holds, to tell "edited" from "just looked".
+    this.openedWith = JSON.stringify(this.state);
+    injectCSS();
+    // Same affordance the loader panel has: a handle for console diagnostics.
+    node._mmh3Editor = this;
+    this.build();
+    this.render();
+    document.body.append(this.overlay);
+    this.applyScale();
+    this.applyHighlight();
+    // Reopen where you left off: if this node's draft was active when the
+    // modal last closed, restore draft mode once the entry arrives.
+    draftApi("/load", { id: draftIdFor(node) }).then((res) => {
+      this.node._mmh3DraftActive = !!res.exists;
+      updateSummary(this.node);
+      if (res.exists) {
+        this.draftEntry = res.draft;
+        if (res.draft.mode === "draft" && this.bufferMode === "live" &&
+            this.overlay.isConnected) {
+          this.enterDraft();
+        }
+      }
+    }).catch(() => { /* drafts unavailable: live mode works as ever */ });
+  }
+
+  /* ---------- insertion ---------- */
+  /** Insert a snippet at the caret.
+   *
+   *  opts.newline  — only for [Shot N]; see below.
+   *  opts.wrap     — `text` is an opening tag whose closing half is supplied
+   *                  here. Any selected text is kept and wrapped rather than
+   *                  overwritten; with no selection the caret lands between
+   *                  the two halves, ready to type. */
+  insert(text, opts = {}) {
+    const t = this.lastFocus;
+    if (!t || !t.isConnected) { toast("Click into a text field first"); return; }
+    const start = t.selectionStart ?? t.value.length;
+    const end = t.selectionEnd ?? start;
+    let before = t.value.slice(0, start);
+    let pad;
+    // opts.newline is for [Shot N] and nothing else. A line break anywhere
+    // else reads to the model as a cut, which silently splits the clip.
+    if (opts.newline) {
+      before = before.replace(/\s+$/, "");
+      pad = before ? "\n" : "";
+    } else if (/^[,;]/.test(text)) {
+      pad = "";                     // the snippet supplies its own separator
+    } else {
+      pad = before && !/[\s(\u2014]$/.test(before) ? " " : "";
+    }
+    const after = t.value.slice(end);
+    const base = before.length + pad.length;
+
+    if (opts.wrap) {
+      const held = t.value.slice(start, end);
+      t.value = before + pad + text + held + opts.wrap + after;
+      // Selection wrapped: leave it selected so it can be re-wrapped or
+      // retyped. Nothing selected: sit between the halves.
+      t.selectionStart = base + text.length;
+      t.selectionEnd = base + text.length + held.length;
+    } else {
+      t.value = before + pad + text + after;
+      const dPos = text.indexOf("</d>");
+      t.selectionStart = t.selectionEnd =
+        dPos >= 0 ? base + dPos : base + text.length;
+    }
+    t.focus();
+    t.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  /* ---------- skeleton ---------- */
+  build() {
+    this.formEl = el("div", { class: "mmh3-form" });
+    this.pinsEl = el("div", { class: "mmh3-pins" });
+    this.previewEl = el("pre", { class: "mmh3-preview" });
+    this.issuesEl = el("div", { class: "mmh3-issues" });
+    this.statsEl = el("span", { class: "stats" });
+
+    this.modeBar = el("div", { class: "mmh3-modes" },
+      MODES.map((m) => el("button", {
+        title: m.hint,
+        onclick: () => { this.state.mode = m.id; this.render(); },
+      }, m.label)));
+    this.modeSends = el("div", { class: "mmh3-modesends" });
+
+    const copyBtn = el("button", { class: "mmh3-btn", onclick: async () => {
+      // Always the live editor state — saving to the node is not a
+      // prerequisite for copying what you've written.
+      const text = generate(this.state);
+      const ok = await copyText(text);
+      // toast's second argument is a duration; >4000 also styles it as a
+      // warning, which is what a failure should look like.
+      if (ok) toast("Prompt copied");
+      else toast("Couldn't reach the clipboard \u2014 select the preview on " +
+                 "the right and copy manually", 6000);
+    }}, "Copy prompt");
+    const cancelBtn = this.cancelBtn = el("button", { class: "mmh3-btn",
+      title: "Close without giving the node these changes",
+      onclick: () => this.requestClose({ discard: true }) }, "Cancel");
+    const saveBtn = this.saveBtn = el("button",
+      { class: "mmh3-btn primary", onclick: () => this.save() },
+      "Save to node");
+
+    const guideBtn = el("button", { class: "mmh3-btn",
+      title: "Open the bundled MiniMax H3 Video Prompt Writing Guide",
+      onclick: () => window.open(
+        new URL("./video-prompt-writing-guide.html", import.meta.url).href,
+        "_blank") }, "\ud83d\udcd6 Guide");
+
+    this.overlay = el("div", { class: "mmh3-overlay",
+      onmousedown: (e) => {
+        if (e.target !== this.overlay) return;
+        if (this.prefsOpen) { this.togglePrefs(false); return; }
+        // Off by preference, this does nothing; on, it still goes through
+        // the unsaved-changes check rather than closing outright.
+        if (this.prefs.closeOnBackdrop) this.requestClose();
+      } },
+      el("div", { class: "mmh3-modal" },
+        el("div", { class: "mmh3-head" },
+          el("div", { class: "mmh3-title" }, "Fantastic H3 Prompt Builder",
+            this.titleTag = el("span", { class: "mmh3-titletag" }, ""),
+            el("small", {}, "guide-conformant output")),
+          guideBtn,
+          this.modeToggle = el("button", { class: "mmh3-btn mmh3-modetoggle",
+            title: "Switch to the draft scratchpad \u2014 the node keeps " +
+              "the Live prompt",
+            onclick: () => this.toggleDraftMode() }, "Draft \u25b6"),
+          el("button", { class: "mmh3-btn",
+            title: "Open the connected Media Loader without leaving the editor",
+            onclick: () => this.openMedia() }, "\u25a3 Media"),
+          el("button", { class: "mmh3-btn",
+            title: "Open the RefMod Stack this prompt's references come from",
+            onclick: () => this.openRefMods() }, "\u25c8 RefMods"),
+          el("button", { class: "mmh3-btn",
+            title: "Browse saved prompts",
+            onclick: () => new Library(this) }, "\u2630 Library"),
+          el("button", { class: "mmh3-btn",
+            title: "Clear every field and start over",
+            onclick: () => { this.clearPending = !this.clearPending; this.render(); } },
+            "Clear"),
+          this.modeBar,
+          this.prefsButton(),
+          el("button", { class: "mmh3-x",
+            onclick: () => this.requestClose() }, "\u2715"),
+        ),
+        this.modeSends,
+        // Draft status sits OUTSIDE the scrolling form on purpose: most of
+        // the work happens far down in the description fields, and a banner
+        // that scrolls away stops answering "am I editing Live?" exactly
+        // when it matters most. The commit decision lands in the same slot,
+        // so the choice appears where the eye already is.
+        this.draftSlot = el("div", { class: "mmh3-draftslot" }),
+        el("div", { class: "mmh3-body" },
+          this.formEl,
+          this.pinsEl,
+          el("div", { class: "mmh3-side" },
+            this.previewEl, this.issuesEl,
+            el("div", { class: "mmh3-foot" }, this.statsEl, copyBtn, cancelBtn, saveBtn),
+          ),
+        ),
+      ),
+    );
+
+    this.formEl.addEventListener("focusin", (e) => {
+      if (e.target.matches("textarea, input[type=text]") &&
+          !e.target.dataset.noinsert) this.lastFocus = e.target;
+    });
+    this.overlay.addEventListener("mousedown", (e) => {
+      if (this.prefsOpen && !e.target.closest(".mmh3-prefwrap")) {
+        this.togglePrefs(false);
+      }
+      if (this._ctxMenu && !e.target.closest(".mmh3-ctxmenu")) this.closeCtx();
+    });
+
+    // Right-click on a selection offers to save it. The browser's own menu
+    // is only replaced when there IS a selection in one of our fields, and
+    // Copy, Cut, Paste and Remove are included so nothing is taken away.
+    this.formEl.addEventListener("contextmenu", (e) => {
+      const box = e.target;
+      if (!box || typeof box.value !== "string") return;
+      const a = box.selectionStart ?? 0;
+      const b = box.selectionEnd ?? 0;
+      // On a tag: replace, swap or remove it. A selection reaching beyond
+      // that one tag keeps the phrase menu.
+      const hit = this.tagUnderPointer(e, box);
+      if (hit && (b <= a || (a >= hit.start && b <= hit.end))) {
+        e.preventDefault();
+        this.openTagMenu(e.clientX, e.clientY, box, hit);
+        return;
+      }
+      if (b <= a) return;                       // no selection: native menu
+      e.preventDefault();
+      this.openCtx(e.clientX, e.clientY, box, a, b);
+    });
+    this.formEl.addEventListener("input", () => {
+      this.updatePreview();
+      this.syncCaretPin();
+    });
+    const caretEvents = ["click", "keyup", "select", "focusin"];
+    caretEvents.forEach((ev) =>
+      this.formEl.addEventListener(ev, () => this.syncCaretPin()));
+    // Dropping a rail card onto a textarea inserts the tag where it lands.
+    this.formEl.addEventListener("drop", (e) => {
+      const t = e.target;
+      if (!t.matches?.("textarea, input[type=text]")) return;
+      setTimeout(() => {
+        this.lastFocus = t;
+        this.updatePreview();
+        this.syncCaretPin();
+      }, 0);
+    });
+    // Both overlays listen on window, and this one registered first — so
+    // without this guard Escape closed the editor out from under whatever
+    // was stacked on top of it.
+    // Goes through requestClose, not close: Escape used to bypass both
+    // preferences entirely, which made "Off means ✕, Cancel and Escape
+    // discard your edits silently" false — it discarded silently either way.
+    this.escHandler = (e) => {
+      if (e.key !== "Escape") return;
+      // A window opened from here owns Escape: the Media Loader, the RefMod
+      // Stack or library, or a crop editor.
+      if (document.querySelector(".mml-overlay, .mmr-overlay, .mml-tmover")) return;
+      if (this._tagMenu) { this.closeTagMenu(); return; }
+      // A strip is already asking a question; Escape shouldn't answer it.
+      if (this.closePending || this.clearPending || this.linkOffer) return;
+      this.requestClose();
+    };
+    window.addEventListener("keydown", this.escHandler);
+  }
+
+  clearAll() {
+    const mode = this.state.mode;          // you're still working in this mode
+    this.state = defaultState();
+    this.state.mode = mode;
+    this.pins = [];
+    this.autoPin = null;
+    // Forget the library entry too, so the next save creates a new prompt
+    // rather than quietly renaming the one that was loaded.
+    this.libraryId = null;
+    this.libraryName = "";
+    this.libraryCategory = "";
+    this.clearPending = false;
+    this.render();
+    toast("Prompt cleared \u2014 nothing saved to the node yet");
+  }
+
+  clearStrip() {
+    return el("div", { class: "mmh3-clearbar" },
+      el("span", { class: "mmh3-clearmsg" },
+        `Clear every field and start a new ${this.state.mode} prompt?`),
+      el("span", { class: "mmh3-clearnote" },
+        "The node keeps its current prompt until you save."),
+      el("div", { class: "mmh3-clearactions" },
+        el("button", { class: "mmh3-btn primary",
+          onclick: () => this.clearAll() }, "Clear"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.clearPending = false; this.render(); } },
+          "Cancel")));
+  }
+
+  /** True when the editor holds something the node hasn't been given. */
+  isDirty() {
+    // Draft edits autosave to disk, so they are never "unsaved". What the
+    // close guard protects in draft mode is the parked LIVE session.
+    if (this.bufferMode === "draft") {
+      try {
+        return !!this._liveHeld &&
+          JSON.stringify(this._liveHeld.state) !== this._liveHeld.openedWith;
+      } catch (e) { return false; }
+    }
+    try { return JSON.stringify(this.state) !== this.openedWith; }
+    catch (e) { return false; }
+  }
+
+  /** Close, but ask first if there's unsaved work.
+   *
+   *  With "save to node when closing" on, the ordinary exits just save —
+   *  except in draft mode, where the parked Live session is still at risk
+   *  and a draft must never reach the node by closing. `discard: true` is
+   *  the Cancel button, which means the opposite and always confirms. */
+  requestClose({ discard = false } = {}) {
+    const drafting = this.bufferMode === "draft";
+    if (!discard && this.prefs.saveOnClose && !drafting) {
+      if (this.isDirty()) this.writeNode();
+      this.close();
+      return;
+    }
+    // Cancel is destructive by definition, so it asks whenever there is
+    // something to lose, even if the warning preference is off.
+    const ask = discard ? this.isDirty()
+                        : (this.prefs.warnUnsaved && this.isDirty());
+    if (!ask) {
+      if (discard) this.state = JSON.parse(this.openedWith);
+      this.close();
+      return;
+    }
+    if (drafting) {
+      // The at-risk work is the parked live session; show it, then ask.
+      this.exitDraft();
+    }
+    this.closePending = true;
+    this.render();
+  }
+
+  prefsButton() {
+    const pct = (v) => `${Math.round(v * 100)}%`;
+    // Deliberately not live: resizing the window moves this menu with it, so
+    // the slider would slide out from under the pointer mid-drag.
+    const pending = { windowScale: this.prefs.windowScale,
+                      textScale: this.prefs.textScale };
+    const inputs = {};
+    const outs = {};
+    const dirty = () => scaleApply.classList.toggle("primary",
+      pending.windowScale !== this.prefs.windowScale ||
+      pending.textScale !== this.prefs.textScale);
+
+    const maxFor = (key) => key === "textScale" ? TEXT_SCALE_MAX : SCALE_MAX;
+
+    const slider = (key, label) => {
+      const out = el("input", { type: "number", class: "mmh3-scaleval",
+        min: String(Math.round(SCALE_MIN * 100)),
+        max: String(Math.round(maxFor(key) * 100)), step: "5",
+        value: String(Math.round(pending[key] * 100)),
+        onchange: (e) => {
+          pending[key] = clampScale(Number(e.target.value) / 100, maxFor(key));
+          const shown = Math.round(pending[key] * 100);
+          e.target.value = String(shown);
+          input.value = String(shown);
+          dirty();
+        },
+        onkeydown: (e) => { if (e.key === "Enter") { e.stopPropagation();
+          e.target.blur(); } } });
+      const input = el("input", { type: "range", class: "mmh3-scalerange",
+        min: String(Math.round(SCALE_MIN * 100)),
+        max: String(Math.round(maxFor(key) * 100)), step: "5",
+        value: String(Math.round(pending[key] * 100)),
+        oninput: (e) => {
+          pending[key] = clampScale(Number(e.target.value) / 100, maxFor(key));
+          out.value = String(Math.round(pending[key] * 100));
+          dirty();
+        } });
+      inputs[key] = input;
+      outs[key] = out;
+      return el("label", { class: "mmh3-scalerow" },
+        el("span", { class: "mmh3-scalelabel" }, label), input, out,
+        el("span", { class: "mmh3-scalepct" }, "%"));
+    };
+    const setScale = (w, t) => {
+      this.prefs.windowScale = w;
+      this.prefs.textScale = t;
+      pending.windowScale = w; pending.textScale = t;
+      inputs.windowScale.value = String(Math.round(w * 100));
+      inputs.textScale.value = String(Math.round(t * 100));
+      outs.windowScale.value = String(Math.round(w * 100));
+      outs.textScale.value = String(Math.round(t * 100));
+      savePrefs(this.prefs);
+      this.applyScale();
+      scaleApply.classList.remove("primary");
+    };
+    const scaleApply = el("button", { class: "mmh3-btn",
+      onclick: () => setScale(pending.windowScale, pending.textScale) }, "Apply");
+    const scaleReset = el("button", { class: "mmh3-btn",
+      onclick: () => setScale(1, 1) }, "Reset");
+
+    const rows = {};
+    const item = (key, label, hint) => {
+      const box = el("input", { type: "checkbox", checked: !!this.prefs[key],
+        onchange: (e) => {
+          this.prefs[key] = e.target.checked;
+          savePrefs(this.prefs);
+          if (key === "highlightTags") this.applyHighlight();
+          syncPrefDeps();
+        } });
+      const hintEl = el("span", { class: "mmh3-prefhint" }, hint);
+      const row = el("label", { class: "mmh3-prefitem" }, box,
+        el("span", {}, el("span", { class: "mmh3-preflabel" }, label), hintEl));
+      rows[key] = { box, row, hintEl, hint };
+      return row;
+    };
+
+    /** "Warn about unsaved changes" has nothing to say once closing saves,
+     *  so it greys out rather than sitting there implying it still applies.
+     *  The stored value is left alone — untick save-on-close and the warning
+     *  comes back exactly as it was. */
+    const syncPrefDeps = () => {
+      const w = rows.warnUnsaved;
+      if (!w) return;
+      const off = !!this.prefs.saveOnClose;
+      w.box.disabled = off;
+      w.row.classList.toggle("off", off);
+      w.hintEl.textContent = off
+        ? "Not used while closing saves \u2014 except in draft mode, and " +
+          "Cancel still asks before discarding."
+        : w.hint;
+    };
+    // Shown so a bug report can name the exact build rather than a version
+    // number that may have covered several.
+    // Drafts are internal state that outlives code changes, so there has to
+    // be a way to wipe them from the UI rather than by deleting a file.
+    const draftLine = el("span", { class: "mmh3-drafthint" }, "counting\u2026");
+    const draftRow = el("div", { class: "mmh3-draftadmin" });
+    const paintDrafts = (count) => {
+      if (!count) {
+        draftLine.textContent = "No saved drafts.";
+        draftRow.replaceChildren(draftLine);
+        return;
+      }
+      draftLine.textContent =
+        `${count} saved draft${count === 1 ? "" : "s"} across all workflows.`;
+      draftRow.replaceChildren(draftLine,
+        el("button", { class: "mmh3-btn",
+          title: "Discard every saved draft on this machine",
+          onclick: () => {
+            draftRow.replaceChildren(
+              el("span", { class: "mmh3-drafthint" },
+                "Discard all drafts? This can't be undone."),
+              el("button", { class: "mmh3-btn mmh3-danger", onclick: async () => {
+                try {
+                  const res = await draftApi("/clear_all", {});
+                  this.draftEntry = null;
+                  this.node._mmh3DraftActive = false;
+                  updateSummary(this.node);
+                  if (this.bufferMode === "draft") this.exitDraft();
+                  toast(`Cleared ${res.cleared} draft${
+                    res.cleared === 1 ? "" : "s"}`);
+                  paintDrafts(0);
+                } catch (e) { toast(`Couldn't clear drafts: ${e.message}`); }
+              } }, "Discard all"),
+              el("button", { class: "mmh3-btn",
+                onclick: () => paintDrafts(count) }, "Cancel"));
+          } }, "Clear all"));
+    };
+    api.fetchApi("/minimax_h3/drafts")
+      .then((r) => r.json())
+      .then((d) => paintDrafts(d.count || 0))
+      .catch(() => { draftLine.textContent = "Drafts unavailable."; });
+
+    const version = el("div", { class: "mmh3-prefversion" }, "version \u2026");
+    api.fetchApi("/minimax_h3/capabilities")
+      .then((r) => r.json())
+      .then((c) => { version.textContent = `Fantastic H3 \u2014 v${c.version || "?"}`; })
+      .catch(() => { version.textContent = "version unavailable"; });
+
+    const menu = el("div", { class: "mmh3-prefmenu" },
+      slider("windowScale", "Window size"),
+      slider("textScale", "Text size"),
+      el("div", { class: "mmh3-scalefoot" }, scaleReset, scaleApply),
+      el("div", { class: "mmh3-prefsep" }),
+      item("highlightTags", "Highlight tags and dialogue",
+           "Off gives plain text fields; hovering a tag still shows its " +
+           "preview."),
+      el("label", { class: "mmh3-prefitem mmh3-prefselect" },
+        el("select", { "aria-label": "Subject name prefix",
+          onchange: (e) => {
+            this.prefs.namePrefix = e.target.value;
+            savePrefs(this.prefs);
+            setNamePrefix(this.prefs.namePrefix);
+            this.render();
+          } },
+          NAME_PREFIXES.map((c) => el("option", { value: c, selected: c === this.prefs.namePrefix }, `${c}Name`))),
+        el("span", {},
+          el("span", { class: "mmh3-preflabel" }, "Subject name prefix"),
+          el("span", { class: "mmh3-prefhint" },
+            "Typed before a subject's name, it stands for \u201c<Subject N> Name\u201d. " +
+            "Changing it doesn't rewrite shorthand you've already typed."))),
+      item("closeOnBackdrop", "Click outside to close",
+           "Off means only \u2715, Cancel and Escape close the window."),
+      item("saveOnClose", "Save to node when closing",
+           "\u2715, Escape and clicking outside give the node your changes " +
+           "instead of asking. Cancel still discards, and drafts are never " +
+           "written to the node by closing."),
+      item("warnUnsaved", "Warn about unsaved changes",
+           "Off means \u2715, Cancel and Escape discard your edits silently."),
+      el("div", { class: "mmh3-prefsep" }),
+      draftRow,
+      version);
+    syncPrefDeps();
+    this.prefsMenu = menu;
+    this.prefsCog = el("button", { class: "mmh3-x", title: "Editor settings",
+      onclick: (e) => { e.stopPropagation(); this.togglePrefs(); } }, "\u2699");
+    return el("span", { class: "mmh3-prefwrap" }, this.prefsCog, menu);
+  }
+
+  /** Show or hide the chips without touching layout: in plain mode the
+   *  textarea paints its own text and the mirror goes transparent, so the
+   *  spans are still there to hover even though you can't see them. */
+  applyHighlight() {
+    const plain = !this.prefs.highlightTags;
+    (this._chipWraps || []).forEach((w) => w.classList.toggle("plain", plain));
+  }
+
+  /** Window scale changes the modal's box; text scale zooms its contents. */
+  applyScale() {
+    const modal = this.overlay?.querySelector(".mmh3-modal");
+    if (!modal) return;
+    const w = clampScale(this.prefs.windowScale);
+    const t = clampScale(this.prefs.textScale, TEXT_SCALE_MAX);
+    modal.style.width = `min(${Math.round(1240 * w)}px, 95vw)`;
+    modal.style.height = `min(${Math.round(860 * w)}px, 92vh)`;
+    // Font size only. zoom scaled the layout as well, which changed how much
+    // fitted rather than how readable it was.
+    document.documentElement.style.setProperty("--mmh3-fs", String(t));
+  }
+
+  togglePrefs(force) {
+    this.prefsOpen = force === undefined ? !this.prefsOpen : force;
+    this.prefsMenu?.classList.toggle("on", this.prefsOpen);
+    this.prefsCog?.classList.toggle("on", this.prefsOpen);
+  }
+
+  closeStrip() {
+    return el("div", { class: "mmh3-clearbar" },
+      el("span", { class: "mmh3-clearmsg" },
+        "You have changes the node hasn't been given."),
+      el("span", { class: "mmh3-clearnote" },
+        "Discarding keeps the node's last saved prompt."),
+      el("div", { class: "mmh3-clearactions" },
+        el("button", { class: "mmh3-btn primary",
+          onclick: () => this.save() }, "Save to node"),
+        el("button", { class: "mmh3-btn mmh3-danger",
+          onclick: () => { this.state = JSON.parse(this.openedWith);
+            this.closePending = false; this.close(); } }, "Discard"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.closePending = false; this.render(); } },
+          "Keep editing")));
+  }
+
+  close() {
+    this.closePeek();
+    this.closeCtx();
+    this.hidePhrasePeek();
+    this.hideTagPeek();
+    window.removeEventListener("keydown", this.escHandler);
+    // The DRAFT buffer flushes to disk with the mode it closed in, so the
+    // editor reopens where you left off. The LIVE buffer carries nothing
+    // over: closing without saving discards live edits — which is what
+    // Cancel says on the tin. Keeping a live draft here made the editor
+    // look like it autosaved: reopening showed changes the node didn't
+    // hold. Draft mode is that idea done right — labeled, tinted, and
+    // never executable.
+    if (this.draftEntry) this.flushDraftSave(this.bufferMode);
+    this.node._mmh3Draft = null;
+    this.overlay.remove();
+  }
+
+  /** Write the active state onto the node's widgets. The one and only path
+   *  by which anything becomes executable. */
+  writeNode() {
+    const pw = this.node.widgets?.find((w) => w.name === "prompt_text");
+    const sw = this.node.widgets?.find((w) => w.name === "builder_state");
+    if (pw) pw.value = generate(this.state);
+    if (sw) sw.value = JSON.stringify(this.state);
+    this.node._mmh3Draft = null;
+    this.closePending = false;
+    this.openedWith = JSON.stringify(this.state);
+    updateSummary(this.node);
+    try {
+      this.node.setDirtyCanvas?.(true, true);
+      app.graph.setDirtyCanvas(true, true);
+    } catch (e) { /* Vue redraws itself */ }
+  }
+
+  save() {
+    // The button is disabled in draft mode; this is the belt to that brace,
+    // since a keyboard shortcut or a stale handler could still land here.
+    if (this.bufferMode === "draft") {
+      toast("This is a draft \u2014 use Commit to Live to put it on the node");
+      return;
+    }
+    this.writeNode();
+    toast("Saved to node");
+    this.close();
+  }
+
+  /** Open the Media Loader's own modal on top of this editor.
+   *
+   *  It's the same LoaderPanel the node hosts — mounting it in a body
+   *  overlay is all "Open loader…" does — so this needs no new UI, just a
+   *  refresh afterwards: adding or reordering media renumbers the tags this
+   *  editor renders. */
+  /** The RefMods counterpart of openMedia: the stack's own panel in a
+   *  window, with its library and Create a click away. */
+  openRefMods() {
+    let { stack, why } = refmodStackFor(this.node);
+    if (!stack && why === "other") {
+      toast("This prompt's RefMods come from a node that isn't a RefMod Stack, " +
+        "so there's no stack panel to open.", 6000);
+      return;
+    }
+    if (!stack) stack = addRefModStack(this.node, { focus: false });
+    if (!stack) return;
+    if (this.bufferMode === "draft") { this.openDraftRefMods(stack); return; }
+    openStackModal(stack, { onClose: () => {
+      // The stack may have changed under a parked draft: refresh tags and staleness.
+      this.draftRefmodsStale = this._refmodsDiverged();
+      this.refreshSlots(); this.render();
+    } });
+  }
+
+  /** The same stack panel, pointed at this draft's RefMods instead of the
+   *  node's stack: it edits a stand-in that holds the draft's picks, and
+   *  the real stack is only written when the draft is committed. Copy-on-
+   *  write like the media: looking without changing anything forks nothing. */
+  openDraftRefMods(stack) {
+    if (!this.draftEntry) return;
+    const live = readStack(stack);
+    const start = this.draftRefmodsView() || live.picks;
+    const startKey = stableStringify(start);
+    const stub = {
+      title: "Draft RefMods \u2014 applied to the stack on commit",
+      widgets: [{ name: "stack_state", value: JSON.stringify({ picks: JSON.parse(JSON.stringify(start)), budget: live.budget }) }],
+    };
+    openStackModal(stub, { onClose: () => {
+      const picks = readStack(stub).picks;
+      if (this.draftEntry && (this.draftRefmods() || stableStringify(picks) !== startKey)) {
+        const v = validateDraftRefmods(JSON.parse(JSON.stringify(picks)));
+        this.draftEntry.refmods = v.items || [];
+        if (v.dropped) this.draftDropped = (this.draftDropped || 0) + v.dropped;
+        this.draftRefmodsStale = this._refmodsDiverged();
+        this.flushDraftSave();
+      }
+      this.refreshSlots();
+      this.render();
+    } });
+  }
+
+  openMedia() {
+    const idx = (this.node.inputs || []).findIndex(
+      (i) => i.name === "references");
+    if (idx < 0) { toast("This node has no references input"); return; }
+    if (this.node.inputs[idx].link == null) {
+      toast("No Media Loader is connected \u2014 use '+ Media loader' " +
+        "on the node first.", 6000);
+      return;
+    }
+    const loader = originNode(this.node, idx);
+    if (!loader || loader.type !== LOADER_NAME) {
+      toast("The references input isn't wired to a Media Loader");
+      return;
+    }
+    if (this.bufferMode === "draft") { this.openDraftMedia(loader); return; }
+    openLoaderModal(loader, { onClose: () => {
+      // Media may have changed under us: refresh tags.
+      this.draftStale = this._mediaDiverged();
+      this.render();
+    } });
+  }
+
+  /** The same LoaderPanel, pointed at this draft's media instead of the
+   *  node's. Nothing about Live moves while this is open — and because the
+   *  overlay covers the canvas, the node's own panel can't be reached at the
+   *  same time, so the two can never be edited at once. */
+  openDraftMedia(loader) {
+    const store = {
+      // Copy-on-write: until the draft is touched it simply shows Live, so
+      // opening the panel to look at it doesn't fork anything.
+      read: () => this.draftView() || loaderItems(this.node) || [],
+      write: (items) => {
+        if (!this.draftEntry) return;
+        const v = validateDraftMedia(JSON.parse(JSON.stringify(items)));
+        this.draftEntry.media = v.items;
+        if (v.dropped) this.draftDropped = (this.draftDropped || 0) + v.dropped;
+        this.draftStale = this._mediaDiverged();
+        this.flushDraftSave();
+        this.refreshSlots();
+        this.render();
+      },
+    };
+    openLoaderModal(loader, {
+      store,
+      draft: true,
+      storeLabel: "Draft media",
+      note: "Editing this draft's own reference set. The Media Loader node " +
+        "keeps its Live media until you commit the draft.",
+      onClose: () => {
+        this.draftStale = this._mediaDiverged();
+        this.refreshSlots();
+        this.render();
+      },
+    });
+  }
+
+  /* ---------- draft mode ---------- */
+
+  /** The two buffers swap wholesale. Everything that defines "what am I
+   *  editing" travels together: state, library identity, session baseline. */
+  _snapshotBuffer() {
+    return {
+      state: this.state,
+      libraryId: this.libraryId,
+      libraryName: this.libraryName,
+      libraryCategory: this.libraryCategory,
+      openedWith: this.openedWith,
+      pins: this.pins,
+      autoPin: this.autoPin,
+    };
+  }
+
+  _restoreBuffer(b) {
+    this.state = b.state;
+    this.libraryId = b.libraryId;
+    this.libraryName = b.libraryName;
+    this.libraryCategory = b.libraryCategory;
+    this.openedWith = b.openedWith;
+    this.pins = b.pins || [];
+    this.autoPin = b.autoPin || null;
+  }
+
+  enterDraft() {
+    if (this.bufferMode === "draft") return;
+    // Unsaved live edits are parked in memory, untouched and unwarned —
+    // they're fully reversible, and the close guard still covers the exit.
+    this._liveHeld = this._snapshotBuffer();
+    this.bufferMode = "draft";
+    this.pullPending = false;
+
+    const e = this.draftEntry;
+    if (e && e.state) {
+      // From disk: normalise before it reaches the renderer.
+      e.state = normaliseState(e.state);
+      // Pre-split entries put the auto-frozen snapshot in `media`, which is
+      // now the "applied on commit" field. Demote it: nothing auto-captured
+      // should ever be written back to the loader.
+      if (e.mediaBase === undefined) {
+        e.mediaBase = Array.isArray(e.media) && e.media.length ? e.media : null;
+        e.media = null;
+      }
+      // Both media fields come from disk unvalidated. Repair them here and
+      // remember what had to go, so the banner can say so — a draft that
+      // silently loses a reference is the bug this guards against.
+      const vm = validateDraftMedia(e.media);
+      const vb = validateDraftMedia(e.mediaBase);
+      e.media = vm.items;
+      e.mediaBase = vb.items;
+      // RefMods follow the same two-field split as media. A draft written
+      // before RefMods existed simply has neither, and follows the stack.
+      const vr = validateDraftRefmods(e.refmods);
+      const vrb = validateDraftRefmods(e.refmodsBase);
+      e.refmods = Array.isArray(e.refmods) ? (vr.items || []) : null;
+      e.refmodsBase = vrb.items;
+      this.draftDropped = vm.dropped + vb.dropped + vr.dropped + vrb.dropped;
+      if (this.draftDropped) {
+        console.warn("[MiniMaxH3 PromptBuilder] draft media: discarded " +
+          `${this.draftDropped} unusable item(s)`);
+      }
+      this._restoreBuffer({
+        state: e.state,
+        libraryId: e.savedTo?.libraryId || null,
+        libraryName: e.savedTo?.libraryName || "",
+        libraryCategory: e.savedTo?.libraryCategory || "",
+        openedWith: JSON.stringify(e.state),
+        pins: [], autoPin: null,
+      });
+    } else {
+      // A fresh draft starts blank in the current mode: the use case is
+      // "start on the NEXT prompt", not "fork this one".
+      const mode = this.state.mode;
+      const blank = defaultState();
+      blank.mode = mode;
+      this._restoreBuffer({ state: blank, libraryId: null, libraryName: "",
+        libraryCategory: "", openedWith: JSON.stringify(blank),
+        pins: [], autoPin: null });
+      this.draftEntry = {
+        mode: "draft",
+        state: blank,
+        // TWO fields, because the snapshot was doing two unrelated jobs and
+        // the overlap was destructive.
+        //
+        //   mediaBase - frozen at creation, DISPLAY ONLY. Reference numbers
+        //     are positional and global, so without it, rearranging Live
+        //     media while the draft says <Picture 3> silently retargets
+        //     that tag. Never applied to the loader.
+        //
+        //   media - written only when the draft's own set is edited through
+        //     the media modal. This IS applied on commit.
+        //
+        // Conflated, every draft froze a copy nobody asked for and then
+        // applied it: start a draft, spend an hour improving Live media,
+        // commit, and the loader silently reverted to the old set.
+        //
+        // Empty stays null, never []: [] is truthy, and as `media` it would
+        // have wiped the loader on commit.
+        mediaBase: this._snapshotMedia(),
+        media: null,
+        // The RefMod picks, split the same way: refmodsBase is frozen for
+        // display, refmods is written only through the draft's own stack
+        // panel and applied to the stack on commit ([] = deliberately none).
+        refmodsBase: this._snapshotRefmods(),
+        refmods: null,
+        savedTo: null,
+      };
+    }
+    this.draftStale = this._mediaDiverged();
+    this.draftRefmodsStale = this._refmodsDiverged();
+    this.node._mmh3DraftActive = true;
+    this.draftDropped = this.draftDropped || 0;
+    this.refreshSlots();
+    this.applyDraftChrome();
+    this.scheduleDraftSave();
+    updateSummary(this.node);
+    this.render();
+  }
+
+  exitDraft() {
+    if (this.bufferMode !== "draft") return;
+    this.flushDraftSave("live");
+    this.bufferMode = "live";
+    if (this._liveHeld) this._restoreBuffer(this._liveHeld);
+    this._liveHeld = null;
+    this.commitPending = false;
+    this.pullPending = false;
+    this.refreshSlots();
+    this.applyDraftChrome();
+    this.render();
+  }
+
+  toggleDraftMode() {
+    if (this.bufferMode === "draft") this.exitDraft();
+    else this.enterDraft();
+  }
+
+  /** The draft entry as it should be written to disk right now.
+   *
+   *  Reads draftEntry.state, NEVER this.state: `this.state` is the draft's
+   *  content only while bufferMode is "draft", and flushDraftSave syncs it
+   *  in exactly that case. Reading it unconditionally meant closing the
+   *  modal from Live mode wrote the LIVE prompt over the stored draft —
+   *  the draft looked wiped on reopen. */
+  draftPayload(modeOverride) {
+    if (!this.draftEntry) return null;
+    return {
+      mode: modeOverride || this.bufferMode,
+      state: this.draftEntry.state,
+      media: this.draftEntry.media ?? null,
+      mediaBase: this.draftEntry.mediaBase ?? null,
+      refmods: this.draftEntry.refmods ?? null,
+      refmodsBase: this.draftEntry.refmodsBase ?? null,
+      savedTo: this.draftEntry.savedTo ?? null,
+    };
+  }
+
+  scheduleDraftSave() {
+    if (this.bufferMode !== "draft") return;
+    clearTimeout(this._draftTimer);
+    this._draftTimer = setTimeout(() => this.flushDraftSave(), 1500);
+  }
+
+  flushDraftSave(modeOverride) {
+    clearTimeout(this._draftTimer);
+    if (!this.draftEntry) return;
+    if (this.bufferMode === "draft") {
+      this.draftEntry.state = this.state;
+      this.draftEntry.mode = modeOverride || "draft";
+    } else if (modeOverride) {
+      this.draftEntry.mode = modeOverride;
+    }
+    const payload = this.draftPayload(this.draftEntry.mode);
+    // The no-empty-drafts rule: a pristine blank with no library tie and no
+    // media or RefMods of its own isn't worth a disk entry — or an LRU slot.
+    const blank = defaultState();
+    blank.mode = payload.state.mode;
+    if (!payload.savedTo && !payload.media && !payload.refmods &&
+        stableStringify(payload.state) === stableStringify(blank)) {
+      return;
+    }
+    draftApi("/save", { id: draftIdFor(this.node), draft: payload })
+      .catch(() => { /* offline blip: the buffer is still in memory */ });
+  }
+
+  clearDraft() {
+    clearTimeout(this._draftTimer);
+    draftApi("/clear", { id: draftIdFor(this.node) })
+      .catch(() => { /* worst case the LRU reaps it */ });
+    this.draftEntry = null;
+    this.draftDropped = 0;
+    this.node._mmh3DraftActive = false;
+    updateSummary(this.node);
+    if (this.bufferMode === "draft") {
+      // Start a fresh blank draft in place rather than dumping to live —
+      // "clear" means "new page", not "close the notebook".
+      const held = this._liveHeld;    // keep the parked live session
+      this.bufferMode = "live";       // let enterDraft do its full setup
+      this.enterDraft();
+      this._liveHeld = held;
+    }
+    this.render();
+  }
+
+  /** True when the buffer matches its last library save exactly. Always
+   *  computed, never stored — stored flags drift, comparisons can't. */
+  cleanSince(savedTo, state) {
+    return !!(savedTo && savedTo.hash && savedTo.hash === stateHash(state));
+  }
+
+  /** Called by the Library after a successful save or load, so the active
+   *  buffer remembers what it's clean against. */
+  noteLibraryIdentity() {
+    const rec = {
+      libraryId: this.libraryId,
+      libraryName: this.libraryName,
+      libraryCategory: this.libraryCategory,
+      hash: stateHash(this.state),
+    };
+    if (this.bufferMode === "draft") {
+      if (this.draftEntry) {
+        this.draftEntry.savedTo = rec;
+        this.flushDraftSave();
+      }
+    } else {
+      this.node.properties = this.node.properties || {};
+      this.node.properties.mmh3_live_saved = rec;
+    }
+    this.applyDraftChrome();
+  }
+
+  /** The loader's current set, or null when there's nothing worth freezing. */
+  _snapshotMedia() {
+    const items = loaderItems(this.node);
+    return (Array.isArray(items) && items.length) ? items : null;
+  }
+
+  /** The picks of the stack this prompt's RefMods come from, or null. */
+  _snapshotRefmods() {
+    const { stack } = refmodStackFor(this.node);
+    if (!stack) return null;
+    const picks = readStack(stack).picks;
+    return picks.length ? JSON.parse(JSON.stringify(picks)) : null;
+  }
+
+  /** RefMods the draft OWNS — edited through its own stack panel, applied to
+   *  the stack on commit. Null = never edited (follows the stack); [] = the
+   *  draft deliberately has none, which does clear the stack on commit. */
+  draftRefmods() {
+    const r = this.draftEntry?.refmods;
+    return Array.isArray(r) ? r : null;
+  }
+
+  /** What the draft DISPLAYS for RefMods: its own set, else the frozen
+   *  base, else null (the stack itself). Display only. */
+  draftRefmodsView() {
+    if (!this.draftEntry) return null;
+    const own = this.draftRefmods();
+    if (own) return own;
+    const b = this.draftEntry.refmodsBase;
+    return (Array.isArray(b) && b.length) ? b : null;
+  }
+
+  /** True when the stack has moved on from the picks this draft froze. */
+  _refmodsDiverged() {
+    if (this.draftRefmods()) return false;
+    const b = this.draftEntry?.refmodsBase;
+    if (!Array.isArray(b) || !b.length) return false;
+    const { stack } = refmodStackFor(this.node);
+    if (!stack) return true;                  // stack unwired since creation
+    const strip = (picks) => picks.map(({ missing, ...p }) => p);
+    return stableStringify(strip(b)) !== stableStringify(strip(readStack(stack).picks));
+  }
+
+  /** Media the draft OWNS — edited deliberately, and applied on commit.
+   *  Null means the draft has never been given media of its own. Always go
+   *  through this: a bare `.media` check treats [] as a real set. */
+  draftMedia() {
+    const m = this.draftEntry?.media;
+    return (Array.isArray(m) && m.length) ? m : null;
+  }
+
+  /** What the draft DISPLAYS: its own set if it has one, else the frozen
+   *  base, else whatever the node currently holds. Display only — commit
+   *  never reads this. */
+  draftView() {
+    if (!this.draftEntry) return null;
+    const own = this.draftMedia();
+    if (own) return own;
+    const b = this.draftEntry.mediaBase;
+    return (Array.isArray(b) && b.length) ? b : null;
+  }
+
+  /** True when the frozen base no longer matches the node — i.e. the tags
+   *  this draft was written against describe a set the loader has moved on
+   *  from. Only meaningful while the draft has no media of its own. */
+  _mediaDiverged() {
+    if (this.draftMedia()) return false;      // own set: nothing to compare
+    const b = this.draftEntry?.mediaBase;
+    if (!Array.isArray(b) || !b.length) return false;
+    const now = loaderItems(this.node);
+    if (!now) return true;                    // loader unwired since creation
+    return stableStringify(b) !== stableStringify(now);
+  }
+
+  refreshSlots() {
+    if (this.bufferMode !== "draft") { this.slots = getRefSlots(this.node); return; }
+    // A draft stands in for the loader's items and the stack's picks where it
+    // has its own (or frozen) copies; the wiring itself is always live.
+    const snap = this.draftView(), picks = this.draftRefmodsView();
+    this.slots = getRefSlots(this.node, {
+      media: snap || undefined, mediaLabel: this.draftMedia() ? "Draft media" : "Media Loader",
+      picks: picks || undefined, picksLabel: this.draftRefmods() ? "Draft RefMods" : "RefMod Stack",
+    }) || getRefSlots(this.node);
+  }
+
+  /** A loaded prompt named a media preset. Never apply it silently: it
+   *  replaces whatever is in the loader, and reference numbering is
+   *  positional, so a preset edited since linking can retarget the tags in
+   *  the prompt that just loaded. */
+  async offerLinkedMedia(presetName, savedDigest) {
+    let info = null;
+    try {
+      info = await presetApi("/load", { name: presetName });
+    } catch (e) {
+      toast(`This prompt is linked to media preset \u201c${presetName}\u201d, ` +
+        "which no longer exists.", 7000);
+      return;
+    }
+    this.linkOffer = {
+      name: presetName,
+      items: info.items || [],
+      missing: info.missing || [],
+      changed: !!(savedDigest && info.digest && savedDigest !== info.digest),
+    };
+    this.render();
+  }
+
+  async offerLinkedRefmods(presetName, savedDigest) {
+    let info = null;
+    try {
+      info = await refmodPresetApi("/load", { name: presetName });
+    } catch (e) {
+      toast(`This prompt is linked to RefMod preset \u201c${presetName}\u201d, which no longer exists.`, 7000);
+      return;
+    }
+    this.refmodOffer = {
+      name: presetName,
+      picks: info.picks || [],
+      missing: info.missing || [],
+      changed: !!(savedDigest && info.digest && savedDigest !== info.digest),
+    };
+    this.render();
+  }
+
+  refmodLinkStrip() {
+    const o = this.refmodOffer;
+    if (!o) return null;
+    const drafting = this.bufferMode === "draft";
+    let current = 0;
+    try {
+      if (drafting) current = (this.draftRefmodsView() || []).length;
+      else { const { stack } = refmodStackFor(this.node); current = stack ? readStack(stack).picks.length : 0; }
+    } catch (e) { current = 0; }
+    const target = drafting ? "this draft's RefMods" : "the RefMod Stack";
+    const n = o.picks.filter((p) => p.on !== false).length;
+    return el("div", { class: "mmh3-commitstrip" },
+      el("span", { class: "mmh3-commitmsg" },
+        `This prompt is linked to RefMod preset \u201c${o.name}\u201d ` +
+        `(${n} RefMod${n === 1 ? "" : "s"}, with weights). ` +
+        `Loading it replaces ${current} in ${target}.`,
+        o.changed
+          ? el("span", { class: "mmh3-linkwarn" },
+              " \u26a0 That preset has changed since this prompt was saved, " +
+              "so its labels may no longer line up with the tags in the text.")
+          : null,
+        o.missing.length
+          ? el("span", { class: "mmh3-linkwarn" },
+              ` \u26a0 ${o.missing.length} file(s) in the preset are missing from the library.`)
+          : null),
+      el("div", { class: "mmh3-commitrow" },
+        el("button", { class: "mmh3-btn primary",
+          onclick: () => this.applyLinkedRefmods() }, "Load the RefMods too"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.refmodOffer = null; this.render(); } },
+          "Prompt only")));
+  }
+
+  applyLinkedRefmods() {
+    const o = this.refmodOffer;
+    this.refmodOffer = null;
+    if (!o) return;
+    const picks = JSON.parse(JSON.stringify(o.picks));
+    if (this.bufferMode === "draft") {
+      // The draft takes the set as its own; it reaches the stack on commit.
+      if (this.draftEntry) {
+        const v = validateDraftRefmods(picks);
+        this.draftEntry.refmods = v.items || [];
+        if (v.dropped) this.draftDropped = (this.draftDropped || 0) + v.dropped;
+        this.draftRefmodsStale = this._refmodsDiverged();
+        this.flushDraftSave();
+      }
+    } else {
+      this._applyRefmodSnapshot(picks);
+    }
+    this.refreshSlots();
+    this.render();
+    toast(`Loaded RefMod preset \u201c${o.name}\u201d`);
+  }
+
+  linkStrip() {
+    const o = this.linkOffer;
+    if (!o) return null;
+    const drafting = this.bufferMode === "draft";
+    const currentCount = drafting
+      ? (this.draftView() || []).length
+      : (loaderItems(this.node) || []).length;
+    const target = drafting ? "this draft's media" : "the Media Loader";
+    return el("div", { class: "mmh3-commitstrip" },
+      el("span", { class: "mmh3-commitmsg" },
+        `This prompt is linked to media preset \u201c${o.name}\u201d ` +
+        `(${o.items.length} reference${o.items.length === 1 ? "" : "s"}). ` +
+        `Loading it replaces ${currentCount} in ${target}.`,
+        o.changed
+          ? el("span", { class: "mmh3-linkwarn" },
+              " \u26a0 That preset has changed since this prompt was saved, " +
+              "so its reference numbers may no longer line up with the tags " +
+              "in the text.")
+          : null,
+        o.missing.length
+          ? el("span", { class: "mmh3-linkwarn" },
+              ` \u26a0 ${o.missing.length} file(s) in the preset are missing ` +
+              "and will be skipped.")
+          : null),
+      el("div", { class: "mmh3-commitrow" },
+        el("button", { class: "mmh3-btn primary",
+          onclick: () => this.applyLinkedMedia() }, "Load the media too"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.linkOffer = null; this.render(); } },
+          "Prompt only")));
+  }
+
+  applyLinkedMedia() {
+    const o = this.linkOffer;
+    this.linkOffer = null;
+    if (!o) return;
+    if (this.bufferMode === "draft") {
+      // Never touch the executable node from inside a draft: the draft takes
+      // the set as its own, and it reaches the loader only on commit.
+      if (this.draftEntry) {
+        const v = validateDraftMedia(JSON.parse(JSON.stringify(o.items)));
+        this.draftEntry.media = v.items;
+        if (v.dropped) this.draftDropped = (this.draftDropped || 0) + v.dropped;
+        this.draftStale = this._mediaDiverged();
+        this.flushDraftSave();
+      }
+    } else {
+      this._applyMediaSnapshot(o.items);
+    }
+    this.refreshSlots();
+    this.render();
+    toast(`Loaded media preset \u201c${o.name}\u201d`);
+  }
+
+  /** Copy the Live prompt into the draft.
+   *
+   *  "setup" keeps the scaffolding that costs real effort — mode, duration,
+   *  subject definitions, style, retention markers — and blanks the
+   *  per-shot writing, which is the shape of chaining one shot to the next.
+   *  "all" is a straight fork, for working up a variant.
+   *
+   *  Live is never touched: this reads the parked live buffer (or the node
+   *  when there isn't one) and writes only the draft. */
+  pullFromLive(scope) {
+    const srcState = this._liveHeld?.state ?? loadState(this.node);
+    const next = normaliseState(JSON.parse(JSON.stringify(srcState)));
+    if (scope === "setup") {
+      const d = defaultState();
+      next.imd = d.imd;
+      next.soundscape = d.soundscape;
+      next.ref.summaryText = d.ref.summaryText;
+      next.ref.detail = d.ref.detail;
+      next.ref.soundscape = d.ref.soundscape;
+    }
+    this.state = next;
+    this.openedWith = JSON.stringify(next);
+    this.pins = [];
+    this.autoPin = null;
+    if (this.draftEntry) {
+      // The pulled text's tags are numbered against the node's media as it
+      // is now, so re-freeze the display base to match. A media set the
+      // draft OWNS is left alone — that was a deliberate choice.
+      this.draftEntry.mediaBase = this._snapshotMedia();
+      this.draftStale = this._mediaDiverged();
+      if (!this.draftRefmods()) {
+        this.draftEntry.refmodsBase = this._snapshotRefmods();
+        this.draftRefmodsStale = this._refmodsDiverged();
+      }
+    }
+    this.pullPending = false;
+    this.flushDraftSave();
+    this.refreshSlots();
+    this.render();
+    toast(scope === "setup"
+      ? "Pulled the cast and setup from Live"
+      : "Pulled the Live prompt into this draft");
+  }
+
+  pullStrip() {
+    if (!this.pullPending) return null;
+    const blank = (() => {
+      const d = defaultState(); d.mode = this.state.mode;
+      return stableStringify(this.state) === stableStringify(d);
+    })();
+    return el("div", { class: "mmh3-commitstrip" },
+      el("span", { class: "mmh3-commitmsg" },
+        blank
+          ? "Copy the Live prompt into this draft."
+          : "Copy the Live prompt into this draft, replacing what's here. " +
+            "Live itself is not changed."),
+      el("div", { class: "mmh3-commitrow" },
+        el("button", { class: "mmh3-btn primary",
+          title: "Keep the mode, duration, subjects, style and retention " +
+            "markers; leave the description fields empty for the next shot",
+          onclick: () => this.pullFromLive("setup") }, "Cast and setup only"),
+        el("button", { class: "mmh3-btn",
+          title: "Copy the whole Live prompt, description included",
+          onclick: () => this.pullFromLive("all") }, "Everything"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.pullPending = false; this.render(); } },
+          "Cancel")));
+  }
+
+  /** Commit: the single doorway from draft to executable. */
+  commitDraft() {
+    const liveState = this._liveHeld?.state ?? loadState(this.node);
+    const liveSaved = this.node.properties?.mmh3_live_saved;
+    const b = defaultState();
+    b.mode = liveState.mode;
+    const liveBlank = stableStringify(liveState) === stableStringify(b);
+    // The only genuinely destructive edge in the whole feature: live being
+    // displaced while unfiled. Everything else is recoverable by design.
+    if (!liveBlank && !this.cleanSince(liveSaved, liveState)) {
+      this.commitPending = "guard";
+      this.render();
+      return;
+    }
+    this._doCommit();
+  }
+
+  _doCommit() {
+    const committed = this.state;
+    // Only a set the draft OWNS is applied. The frozen base is display-only:
+    // applying it would revert any media work done on Live while drafting.
+    const media = this.draftMedia();
+    const refmods = this.draftRefmods();
+    // Draft becomes live: adopt its state and library identity as the live
+    // buffer, write the node, apply the media snapshot through the same
+    // front door presets use, and consume the draft entry.
+    this.bufferMode = "live";
+    this._liveHeld = null;
+    this.commitPending = false;
+    this.pullPending = false;
+    this.state = committed;
+    this.writeNode();
+    if (media) this._applyMediaSnapshot(media);
+    if (refmods) this._applyRefmodSnapshot(refmods);
+    clearTimeout(this._draftTimer);
+    draftApi("/clear", { id: draftIdFor(this.node) }).catch(() => {});
+    this.draftEntry = null;
+    this.draftDropped = 0;
+    this.node._mmh3DraftActive = false;
+    updateSummary(this.node);
+    this.refreshSlots();
+    this.applyDraftChrome();
+    toast("Draft committed to Live");
+    this.render();
+  }
+
+  /** Write a draft's picks into the stack this prompt's RefMods come from,
+   *  keeping the stack's own token budget. */
+  _applyRefmodSnapshot(picks) {
+    try {
+      const { stack } = refmodStackFor(this.node);
+      if (!stack) { toast("The draft's RefMods had no stack to go to \u2014 use + RefMods first", 5000); return; }
+      const w = stack.widgets?.find((x) => x.name === "stack_state");
+      if (!w) return;
+      w.value = JSON.stringify({ picks: JSON.parse(JSON.stringify(picks)), budget: readStack(stack).budget });
+      stack._mmrPanel?.reload();
+      stack.setDirtyCanvas?.(true, true);
+    } catch (e) { console.error("[MiniMaxH3 PromptBuilder] applying draft RefMods failed:", e); }
+  }
+
+  _applyMediaSnapshot(items) {
+    // Same shape as presets/load on the loader panel: replace the items
+    // array and let the panel's own commit() do everything else. The
+    // loader stays single-buffered and mode-ignorant.
+    try {
+      const idx = (this.node.inputs || []).findIndex(
+        (i) => i.name === "references");
+      if (idx < 0 || this.node.inputs[idx].link == null) return;
+      const loader = originNode(this.node, idx);
+      if (!loader || loader.type !== LOADER_NAME) return;
+      const panel = loader._mmlPanel || loader._mmlPanels?.[0];
+      if (panel) {
+        panel.items = JSON.parse(JSON.stringify(items));
+        panel.presetName = "";
+        panel.commit();
+      } else {
+        const w = loader.widgets?.find((x) => x.name === "media_state");
+        if (w) w.value = JSON.stringify(items);
+      }
+    } catch (e) {
+      console.error("[MiniMaxH3 PromptBuilder] draft media apply failed:", e);
+      toast("Draft media couldn't be applied to the loader \u2014 see console");
+    }
+  }
+
+  applyDraftChrome() {
+    const modal = this.overlay?.querySelector(".mmh3-modal");
+    if (!modal) return;
+    const drafting = this.bufferMode === "draft";
+    modal.classList.toggle("draft", drafting);
+    if (this.modeToggle) {
+      this.modeToggle.textContent = drafting ? "\u25c0 Live" : "Draft \u25b6";
+      this.modeToggle.title = drafting
+        ? "Back to the Live prompt (the one on the node)"
+        : "Switch to the draft scratchpad \u2014 the node keeps the Live prompt";
+      this.modeToggle.classList.toggle("draft", drafting);
+    }
+    if (this.titleTag) this.titleTag.textContent = drafting ? "\u2014 Draft" : "";
+    if (this.saveBtn) {
+      // Nothing in a draft can reach the node except through Commit, so the
+      // one button that writes the node must not look available here.
+      // Disabled rather than relabelled: the commit action already lives in
+      // the banner above, and two doors to it invites clicking the wrong one.
+      this.saveBtn.disabled = drafting;
+      this.saveBtn.classList.toggle("off", drafting);
+      this.saveBtn.title = drafting
+        ? "Drafts can't be saved to the node \u2014 use Commit to Live above"
+        : "";
+    }
+  }
+
+  draftBar() {
+    if (this.bufferMode !== "draft") return null;
+    const saved = this.draftEntry?.savedTo;
+    const clean = this.cleanSince(saved, this.state);
+    const status = saved
+      ? (clean ? `saved to library as \u201c${saved.libraryName}\u201d`
+               : `edited since it was saved as \u201c${saved.libraryName}\u201d`)
+      : "not in the library";
+    return el("div", { class: "mmh3-draftbar" },
+      el("span", { class: "mmh3-draftbadge" }, "DRAFT"),
+      this.draftDropped
+        ? el("span", { class: "mmh3-draftdropped",
+            title: "Items that were missing a file or had an unknown type. " +
+              "See the browser console for details." },
+            `\u26a0 ${this.draftDropped} unusable reference item` +
+            `${this.draftDropped === 1 ? "" : "s"} discarded`)
+        : null,
+      el("span", { class: "mmh3-draftmsg" },
+        "The node still holds the Live prompt. Nothing here is queued or " +
+        "executed until you commit it to Live.",
+        el("span", { class: "mmh3-draftstatus" },
+          ` \u2014 ${status}` +
+          (this.draftMedia()
+            ? " \u00b7 has its own media, applied on commit"
+            : (this.draftStale
+              ? " \u00b7 showing media as of when this draft was started; " +
+                "the loader has changed since"
+              : " \u00b7 following the node's media")) +
+          (this.draftRefmods()
+            ? " \u00b7 has its own RefMods, applied to the stack on commit"
+            : (this._refmodsDiverged()
+              ? " \u00b7 showing RefMods as of when this draft was started; " +
+                "the stack has changed since"
+              : (this.draftEntry?.refmodsBase ? " \u00b7 following the stack's RefMods" : ""))))),
+      el("div", { class: "mmh3-draftactions" },
+        el("button", { class: "mmh3-btn",
+          title: "Copy the Live prompt into this draft \u2014 " +
+            "Live itself isn't changed",
+          onclick: () => { this.pullPending = true; this.render(); } },
+          "\u21e3 Pull from Live"),
+        el("button", { class: "mmh3-btn primary",
+          title: "Overwrite the Live prompt with this draft",
+          onclick: () => this.commitDraft() }, "Commit to Live"),
+        el("button", { class: "mmh3-btn",
+          title: "Throw this draft away and start a blank one",
+          onclick: () => this.clearDraft() }, "Clear draft")));
+  }
+
+  commitStrip() {
+    if (this.commitPending !== "guard") return null;
+    const liveState = this._liveHeld?.state ?? loadState(this.node);
+    const nameInput = el("input", { type: "text", class: "mmh3-commitname",
+      placeholder: "name for the Live prompt\u2026",
+      value: this._liveHeld?.libraryName || "" });
+    const err = el("span", { class: "mmh3-saveerr" });
+    const saveLive = async (expectNew) => {
+      const value = nameInput.value.trim();
+      if (!value) { err.textContent = "Give it a name first."; return; }
+      const body = {
+        name: value,
+        category: this._liveHeld?.libraryCategory || "",
+        favorite: false,
+        mode: liveState.mode,
+        refs: 0,
+        prompt: generate(liveState),
+        state: liveState,
+      };
+      if (expectNew) body.expect_new = true;
+      const res = await libApi("/save", body);
+      this.node.properties = this.node.properties || {};
+      this.node.properties.mmh3_live_saved = {
+        libraryId: res.id, libraryName: res.name,
+        libraryCategory: body.category,
+        hash: stateHash(liveState),
+      };
+      toast(`Live prompt saved as \u201c${res.name}\u201d`);
+      this._doCommit();
+    };
+    return el("div", { class: "mmh3-commitstrip" },
+      el("span", { class: "mmh3-commitmsg" },
+        "The Live prompt has work that isn't in the library. Committing " +
+        "this draft will overwrite it."),
+      el("div", { class: "mmh3-commitrow" },
+        nameInput,
+        el("button", { class: "mmh3-btn primary",
+          onclick: async () => {
+            try {
+              await saveLive(nameInput.value.trim() !==
+                (this._liveHeld?.libraryName || ""));
+            } catch (e2) {
+              if (e2.exists) {
+                err.replaceChildren(
+                  `\u201c${nameInput.value.trim()}\u201d already exists. `,
+                  el("button", { class: "mmh3-btn", onclick: async () => {
+                    try { await saveLive(false); }
+                    catch (e3) { err.textContent = e3.message; }
+                  } }, "Overwrite it"));
+              } else err.textContent = e2.message;
+            }
+          } }, "Save Live to library, then commit"),
+        el("button", { class: "mmh3-btn mmh3-danger",
+          onclick: () => this._doCommit() }, "Overwrite Live"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.commitPending = false; this.render(); } },
+          "Cancel")),
+      err);
+  }
+
+  /* ---------- shared UI pieces ---------- */
+
+  ta(obj, key, rows, placeholder) {
+    const box = el("textarea", {
+      rows, placeholder,
+      value: obj[key] ?? "",
+      oninput: (e) => { obj[key] = e.target.value; },
+    });
+    return this.chipField(box);
+  }
+
+  /* --- reference tags as chips ------------------------------------- */
+
+  /** Wrap a textarea so <Picture 1> and friends read as chips.
+   *
+   *  A textarea can't contain elements, so a mirror div renders the same
+   *  text underneath with the tags wrapped in spans. The textarea keeps its
+   *  own text transparent, which leaves selection, undo, IME and paste
+   *  exactly as the browser implements them — a contenteditable rewrite
+   *  would put all of that on us. */
+  chipField(box) {
+    const mirror = el("div", { class: "mmh3-chipmirror", "aria-hidden": "true" });
+    // Order matters: the mirror is painted ON TOP of the textarea so the
+    // selection band (drawn by the textarea) sits behind the glyphs instead
+    // of covering them. It's click-through, so the textarea still gets every
+    // pointer event.
+    const wrap = el("div", { class: "mmh3-chipwrap" }, box, mirror);
+    (this._chipWraps = this._chipWraps || []).push(wrap);
+    if (!this.prefs?.highlightTags) wrap.classList.add("plain");
+    box.classList.add("mmh3-chiptext");
+
+    const paint = () => {
+      const text = box.value || "";
+      mirror.replaceChildren();
+      let last = 0;
+      for (const m of text.matchAll(PAINT_RE)) {
+        if (m.index > last)
+          mirror.append(document.createTextNode(text.slice(last, m.index)));
+        mirror.append(...this.paintToken(m[0]));
+        last = m.index + m[0].length;
+      }
+      // The trailing newline keeps the mirror's last line height in step with
+      // the textarea's when the text ends mid-line.
+      mirror.append(document.createTextNode(text.slice(last) + "\n"));
+      // Typing a subject's name: the rest of it, greyed after the caret.
+      const g = box._ghost = this.nameSuggestion(box);
+      box._ghostKey = g ? `${g.pos}|${g.name}` : "";
+      if (g) insertGhost(mirror, g.pos, g.name.slice(g.typed));
+      syncBox();
+    };
+
+    /* A textarea that overflows grows a scrollbar, which narrows its text
+       column. The mirror has overflow:hidden and keeps full width, so without
+       this its lines wrap later than the real ones and the gap widens down
+       the field — the caret drifting further from the glyphs the more you
+       write. Platforms differ (macOS overlays them, Linux and Windows often
+       don't), so measure rather than assume. */
+    const syncBox = () => {
+      const bw = box.offsetWidth - box.clientWidth
+        - (parseFloat(getComputedStyle(box).borderLeftWidth) || 0)
+        - (parseFloat(getComputedStyle(box).borderRightWidth) || 0);
+      const gutter = Math.max(0, Math.round(bw));
+      const want = `${9 + gutter}px`;
+      if (mirror.style.paddingRight !== want) mirror.style.paddingRight = want;
+      mirror.scrollTop = box.scrollTop;
+      mirror.scrollLeft = box.scrollLeft;
+    };
+
+    box.addEventListener("input", () => { box._ghostOff = false; });
+    box.addEventListener("input", paint);
+    box.addEventListener("scroll", syncBox);
+    // The suggestion follows the caret, and Tab takes it.
+    const caretMoved = () => {
+      const g = this.nameSuggestion(box);
+      if ((g ? `${g.pos}|${g.name}` : "") !== (box._ghostKey || "")) paint();
+    };
+    ["keyup", "click", "focus"].forEach((ev) => box.addEventListener(ev, caretMoved));
+    box.addEventListener("blur", () => { if (box._ghostKey) paint(); });
+    box.addEventListener("keydown", (e) => {
+      const g = box._ghost;
+      if (!g) return;
+      if (e.key === "Tab" && !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        editField(box, g.pos - g.typed, g.pos, g.name);
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();            // hides the suggestion, not the editor
+        box._ghostOff = true;
+        paint();
+      }
+    });
+    // Dragging the resize grip can add or remove the scrollbar.
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(syncBox).observe(box);
+    }
+    // Hover a chip for its thumbnail. The mirror can't take pointer events
+    // (it sits under the textarea), so hit-test the chip boxes directly.
+    box.addEventListener("mousemove", (e) => this.chipHover(e, mirror));
+    box.addEventListener("mouseleave", () => this.chipLeave());
+
+    this._chipFields = this._chipFields || [];
+    this._chipFields.push(paint);
+    paint();
+    return wrap;
+  }
+
+  /** A subject name to finish: the caret sits right after "!cas" and a
+   *  switched-on subject is named castle_with_moat. First match
+   *  alphabetically when several start the same way. */
+  nameSuggestion(box) {
+    if (box._ghostOff || document.activeElement !== box) return null;
+    const pos = box.selectionStart;
+    if (pos == null || pos !== box.selectionEnd) return null;
+    const v = box.value || "";
+    if (/[\w-]/.test(v[pos] || "")) return null;          // mid-word: nothing to finish
+    const m = v.slice(0, pos).match(new RegExp(`(?:^|[^\\w])${reEsc(NAME_PREFIX)}([A-Za-z][\\w-]*)$`));
+    if (!m) return null;
+    const typed = m[1], low = typed.toLowerCase();
+    const hits = Object.values(subjectNames(this.state)).map((n) => n.name)
+      .filter((n) => n.length > typed.length && n.toLowerCase().startsWith(low))
+      .sort((a, b) => a.localeCompare(b));
+    return hits.length ? { pos, typed: typed.length, name: hits[0] } : null;
+  }
+
+  /** Render one matched token as the spans the mirror shows. */
+  paintToken(tok) {
+    if (tok.startsWith("<d>")) {
+      const inner = tok.slice(3, -4);
+      const kids = [el("span", { class: "mmh3-dmark" }, "<d>")];
+      const lang = inner.match(LANG_RE);
+      const body = lang ? inner.slice(lang[0].length) : inner;
+      if (lang) kids.push(el("span", { class: "mmh3-dlang" }, lang[1]));
+      kids.push(el("span", { class: "mmh3-dtext" }, ...deliverySpans(body, subjectNames(this.state))));
+      kids.push(el("span", { class: "mmh3-dmark" }, "</d>"));
+      return [el("span", { class: "mmh3-dblock" }, ...kids)];
+    }
+    if (tok.startsWith("[Shot")) {
+      return [el("span", { class: "mmh3-reftag shot" }, tok)];
+    }
+    if (tok.startsWith("(")) {
+      return [el("span", { class: "mmh3-reftag spk", dataset: { tag: tok } }, tok)];
+    }
+    if (tok.startsWith(NAME_PREFIX) && !tok.startsWith("<")) {
+      const hit = lookupName(subjectNames(this.state), tok.slice(1));
+      return [el("span", { class: "mmh3-reftag " + (hit ? "subj" : "unknown"), dataset: { tag: tok },
+        title: hit ? `${hit.tag} ${hit.name} in the prompt` : "No subject has this name" }, tok)];
+    }
+    let cls;
+    if (tok.startsWith("<Subject")) {
+      cls = this.subjectInfo(tok) ? "subj" : "unknown";
+    } else {
+      const slot = this.slotFor(tok);
+      cls = slot ? (slot.cls || "pic") : "unknown";
+    }
+    return [el("span", { class: "mmh3-reftag " + cls, dataset: { tag: tok } }, tok)];
+  }
+
+  /** What a <Subject N> chip should show: the first picture its definition
+   *  cites, plus every media tag that line mentions. */
+  subjectInfo(tag) {
+    const defs = this.state?.ref?.subjectDefs || [];
+    const line = defs.find((d) => !d.off &&
+      (d.text || "").trim().startsWith(tag));
+    if (!line) return null;
+    const tags = [...new Set((line.text.match(TAG_RE) || [])
+      .filter((t) => t !== tag))];
+
+    // A voice reference is usually declared the other way round — the audio's
+    // own line names the subject ("<Audio 1> is the voice-timbre reference
+    // for <Subject 1> (S1)") — so the attachment has to be read from every
+    // other definition that mentions this subject, not just its own.
+    const voices = [], speakers = [];
+    for (const d of defs) {
+      if (d === line || d.off) continue;
+      const text = d.text || "";
+      if (!text.includes(tag)) continue;
+      for (const t of text.match(TAG_RE) || [])
+        if (t.startsWith("<Audio") && !tags.includes(t) && !voices.includes(t))
+          voices.push(t);
+      for (const m of text.matchAll(/\((S\d+(?:\s*,\s*S\d+)*)\)/g))
+        if (!speakers.includes(m[0])) speakers.push(m[0]);
+    }
+    for (const m of (line.text || "").matchAll(/\((S\d+(?:\s*,\s*S\d+)*)\)/g))
+      if (!speakers.includes(m[0])) speakers.push(m[0]);
+
+    const slot = tags.map((t) => this.slotFor(t))
+      .find((sl) => sl && sl.preview?.url && sl.preview.type === "img")
+      || tags.map((t) => this.slotFor(t)).find((sl) => sl && sl.preview?.url);
+    return { slot, tags, voices, speakers, line, name: (line.name || "").trim() };
+  }
+
+  slotFor(tag) {
+    if (!this._slotMap || this._slotMapAt !== this.slots)
+      this._slotMap = new Map((this.slots || []).map((s) => [s.tag, s]));
+    this._slotMapAt = this.slots;
+    return this._slotMap.get(tag);
+  }
+
+  chipHover(e, mirror) {
+    let hit = null;
+    for (const chip of mirror.querySelectorAll(".mmh3-reftag")) {
+      const r = chip.getBoundingClientRect();
+      if (e.clientX >= r.left && e.clientX <= r.right &&
+          e.clientY >= r.top && e.clientY <= r.bottom) { hit = chip; break; }
+    }
+    if (!hit) { this.chipLeave(); return; }
+    if (this._chipOpenFor === hit.dataset.tag) return;
+    this.chipLeave();
+    const tag = hit.dataset.tag;
+    let slot = null, subject = null;
+    if (tag.startsWith(NAME_PREFIX) && !tag.startsWith("<")) {
+      // The shorthand shows the subject it stands for.
+      const named = lookupName(subjectNames(this.state), tag.slice(1));
+      if (!named) return;
+      subject = this.subjectInfo(named.tag);
+      if (!subject) return;
+      slot = subject.slot;
+      this._chipOpenFor = tag;
+      this._chipTimer = setTimeout(() => this.openChipPeek(hit, slot, named.tag, subject), 180);
+      return;
+    }
+    if (tag.startsWith("<Subject")) {
+      subject = this.subjectInfo(tag);
+      if (!subject) return;                  // undefined subject: nothing to show
+      slot = subject.slot;
+    } else {
+      slot = this.slotFor(tag);
+      if (!slot || !slot.preview?.url) return;
+    }
+    this._chipOpenFor = tag;
+    this._chipTimer = setTimeout(
+      () => this.openChipPeek(hit, slot, tag, subject), 180);
+  }
+
+  chipLeave() {
+    clearTimeout(this._chipTimer);
+    this._chipOpenFor = null;
+    if (this._chipPeek) { this._chipPeek.remove(); this._chipPeek = null; }
+  }
+
+  /** Small thumbnail beside the chip. Deliberately not interactive: it must
+   *  never steal the pointer while you're typing. */
+  openChipPeek(chip, slot, tag, subject) {
+    const media = !slot ? null
+      : slot.preview.type === "video"
+      ? el("video", { src: slot.preview.url, muted: true, loop: true,
+          autoplay: true, class: "mmh3-chippeekmedia" })
+      : slot.preview.type === "audio"
+        ? this.mediaThumb(slot, true)
+        : el("img", { src: slot.preview.url, class: "mmh3-chippeekmedia" });
+    const tagRow = (label, list) => list.length
+      ? el("span", { class: "mmh3-chiprow" },
+          el("span", { class: "mmh3-chiplabel" }, label),
+          el("span", { class: "mmh3-chiptags" },
+            list.map((t) => {
+              const sl = this.slotFor(t);
+              return el("span", {
+                class: `mmh3-tagname ${sl ? (sl.cls || "pic") : "unknown"}`,
+              }, t);
+            })))
+      : null;
+    const caption = subject
+      ? el("div", { class: "mmh3-chippeekcap col" },
+          el("span", { class: "mmh3-chiprow" },
+            el("span", { class: "mmh3-tagname subj" }, tag),
+            subject.name ? el("span", { class: "mmh3-chipname" }, subject.name) : null,
+            subject.speakers.length
+              ? el("span", { class: "mmh3-chipspk" }, subject.speakers.join(" "))
+              : null),
+          tagRow("cites", subject.tags),
+          tagRow("voice", subject.voices),
+          (!subject.tags.length && !subject.voices.length)
+            ? el("span", { class: "mmh3-chipnone" }, "no media attached")
+            : null)
+      : el("div", { class: "mmh3-chippeekcap" },
+          el("span", { class: `mmh3-tagname ${slot.cls}` }, slot.tag),
+          el("span", {}, slot.source || ""));
+    const box = el("div", { class: "mmh3-chippeek" }, media, caption);
+    const r = chip.getBoundingClientRect();
+    box.style.left = `${Math.min(r.left, window.innerWidth - 240)}px`;
+    box.style.top = `${r.bottom + 6}px`;
+    document.body.append(box);
+    // Flip above the chip when there's no room below.
+    const bb = box.getBoundingClientRect();
+    if (bb.bottom > window.innerHeight - 8)
+      box.style.top = `${Math.max(8, r.top - bb.height - 6)}px`;
+    this._chipPeek = box;
+  }
+
+  /* Waveforms make audio identifiable at a glance; a generic mic icon does not.
+     Decoded once per URL and cached for the session. */
+  static waveCache = new Map();
+
+  drawWave(canvas, url) {
+    const cached = Editor.waveCache.get(url);
+    const paint = (peaks) => {
+      const w = canvas.width, h = canvas.height;
+      const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = "#b48ce8";
+      const n = peaks.length;
+      for (let x = 0; x < w; x++) {
+        const v = peaks[Math.floor((x / w) * n)] || 0;
+        const bar = Math.max(1, v * (h - 2));
+        ctx.fillRect(x, (h - bar) / 2, 1, bar);
+      }
+    };
+    if (cached) { if (cached.then) cached.then(paint).catch(() => {}); else paint(cached); return; }
+    const job = fetch(url)
+      .then((r) => r.arrayBuffer())
+      .then((buf) => new (window.AudioContext || window.webkitAudioContext)()
+        .decodeAudioData(buf))
+      .then((audio) => {
+        const data = audio.getChannelData(0);
+        const buckets = 160, step = Math.floor(data.length / buckets) || 1;
+        const peaks = [];
+        for (let i = 0; i < buckets; i++) {
+          let peak = 0;
+          for (let j = 0; j < step; j += 8) {
+            const v = Math.abs(data[i * step + j] || 0);
+            if (v > peak) peak = v;
+          }
+          peaks.push(peak);
+        }
+        Editor.waveCache.set(url, peaks);
+        return peaks;
+      });
+    Editor.waveCache.set(url, job);
+    job.then(paint).catch(() => Editor.waveCache.delete(url));
+  }
+
+  /** Whether the current mode can use this reference at all. */
+  usable(slot) {
+    // Text Encode has no per-mode caps: whatever the stack sends, it labels.
+    if (this.slots?.refmod) return true;
+    const cap = MODE_CAPACITY[this.state.mode] || {};
+    return (cap[slot.kind] || 0) >= slot.idx;
+  }
+
+  modeNote(slot) {
+    const cap = MODE_CAPACITY[this.state.mode] || {};
+    const limit = cap[slot.kind] || 0;
+    if (limit === 0)
+      return `${this.state.mode} has no ${slot.kind.toLowerCase()} references — ` +
+        "this is not sent to the model.";
+    return `${this.state.mode} uses only ${slot.kind} 1` +
+      (limit > 1 ? `\u2013${limit}` : "") + " — this is not sent to the model.";
+  }
+
+  citationCount(tag) {
+    if (this._citeText == null) this._citeText = generate(this.state);
+    const esc = tag.replace(/[<>]/g, (c) => "\\" + c);
+    return (this._citeText.match(new RegExp(esc, "g")) || []).length;
+  }
+
+  mediaThumb(s, big) {
+    if (s.preview?.type === "img")
+      return el("img", { class: "mmh3-thumb", src: s.preview.url });
+    if (s.preview?.type === "video")
+      return el("video", { class: "mmh3-thumb", src: s.preview.url, muted: true,
+        loop: true, preload: "metadata",
+        onmouseenter: (e) => e.target.play().catch(() => {}),
+        onmouseleave: (e) => e.target.pause() });
+    const cv = el("canvas", { class: "mmh3-thumb mmh3-wave",
+      width: big ? 220 : 62, height: big ? 60 : 40 });
+    if (s.preview?.url) setTimeout(() => this.drawWave(cv, s.preview.url), 0);
+    return cv;
+  }
+
+  /* --- draft definitions from RefMods ------------------------------ */
+
+  /** One definition line and one retention entry per RefMod in the stack,
+   *  worded from the concept saved in the library (a person, a place, a
+   *  style, a voice…). Names and descriptions are the user's own notes and
+   *  never go into the prompt. Loose loader media is left alone: nothing is known
+   *  about it. A RefMod whose concept was never set is asked about first,
+   *  and the answer can be written back to the library so it isn't asked
+   *  again. Labels that already have a line are skipped. */
+  async draftFromRefmods() {
+    const r = this.state.ref;
+    const slots = this.slots.filter((s) => s.refmod && s.tag);
+    if (!slots.length) { toast("No RefMods are connected"); return; }
+    let library = [];
+    try {
+      const resp = await api.fetchApi("/minimax_h3/refmods", { cache: "no-store" });
+      library = (await resp.json()).items || [];
+    } catch (e) { /* the concept picker covers the gap */ }
+    const infoOf = (file) => {
+      const it = library.find((x) => x.visual?.file === file || x.audio?.file === file);
+      const nm = String(it?.subject_name || "").trim();
+      return { concept: it?.concept || "generic", subjectName: /^[A-Za-z][\w-]{0,39}$/.test(nm) ? nm : "",
+        appearance: oneLine(it?.appearance), voiceDesc: oneLine(it?.voice_description), retained: oneLine(it?.retained_attributes) };
+    };
+    // Group each RefMod's look and voice; a voice-only RefMod has no look.
+    const mods = [];
+    for (const s of slots) {
+      const file = s.slotName.replace(/^refmod:/, "");
+      let m = mods.find((x) => x.uid === s.refmod.uid);
+      if (!m) { m = { uid: s.refmod.uid, name: s.refmod.name, ...infoOf(file) }; mods.push(m); }
+      if (s.refmod.role === "voice") m.voice = s; else m.look = s;
+      // The concept is written to the half it describes: the look's file,
+      // or the voice's when the RefMod is a voice only.
+      if (s.refmod.role !== "voice" || !m.file) m.file = file;
+    }
+    // A RefMod's saved subject name goes on its subject line when that line
+    // has no name of its own yet — including lines drafted before the name
+    // was set in the library. A name you typed is never replaced.
+    const nameLines = (dry = false) => {
+      let named = 0;
+      for (const m of mods) {
+        if (m.subjectName && m.look) {
+          const line = r.subjectDefs.find((d) => !(d.name || "").trim() && /^\s*<Subject \d+>/.test(d.text || "")
+            && (d.text || "").includes(m.look.tag));
+          if (line) { if (!dry) line.name = m.subjectName; named++; }
+        }
+        // A saved voice description fills the voice box on the RefMod's voice line.
+        if (m.voiceDesc && m.voice) {
+          const line = r.subjectDefs.find((d) => !oneLine(d.voice) && voiceBinding(d.text)
+            && (d.text || "").includes(m.voice.tag));
+          if (line) { if (!dry) line.voice = m.voiceDesc; named++; }
+        }
+      }
+      return named;
+    };
+    let how = null;
+    {
+      const citedNow = (tag) => r.subjectDefs.some((d) => (d.text || "").includes(tag));
+      const nothingNew = !mods.some((m) => (m.look && !citedNow(m.look.tag)) || (m.voice && !citedNow(m.voice.tag)));
+      if (nothingNew) {
+        // Every RefMod already has a line: nothing to add, but the two
+        // sections can still be drafted fresh, or blank names filled.
+        how = await this.askOverwrite({ complete: true, names: nameLines(true) });
+        if (!how) return;
+        if (how === "keep") {
+          const named = nameLines();
+          this.render();
+          toast(`Filled ${named} name or voice box${named === 1 ? "" : "es"} from the library`, 4000);
+          return;
+        }
+      }
+    }
+    // Existing lines: add to them, or start the two sections over.
+    const hasText = r.subjectDefs.some((d) => (d.text || "").trim()) || r.retention.some((x) => x.label);
+    if (hasText && !how) {
+      how = await this.askOverwrite();
+      if (!how) return;
+    }
+    if (how === "replace") { r.subjectDefs = []; r.retention = []; }
+    const defText = () => r.subjectDefs.map((d) => d.text).join("\n");
+    const cited = (tag) => defText().includes(tag);
+    const pending = mods.filter((m) => (m.look && !cited(m.look.tag)) || (m.voice && !cited(m.voice.tag)));
+    if (!pending.length) { toast("Every RefMod already has a definition line", 3000); return; }
+
+    // Ask about the ones the library can't describe.
+    const unknown = pending.filter((m) => m.look ? !VISUAL_CONCEPTS.includes(m.concept)
+                                            : !AUDIO_CONCEPTS.includes(m.concept));
+    if (unknown.length) {
+      const answers = await this.askConcepts(unknown);
+      if (!answers) return;                       // cancelled
+      for (const m of unknown) m.concept = answers.choice[m.uid];
+      if (answers.remember) {
+        for (const m of unknown) {
+          try {
+            await postApi("/minimax_h3/refmods/meta", { headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ files: [m.file], concept_type: m.concept }) });
+          } catch (e) { /* the draft still goes ahead */ }
+        }
+      }
+    }
+
+    const usedSpeakers = () => new Set([...defText().matchAll(/\(S(\d+)\)/g)].map((x) => +x[1]));
+    const nextSpeaker = () => { const u = usedSpeakers(); let i = 1; while (u.has(i)) i++; return `S${i}`; };
+    const nextSubject = () => {
+      const n = [...defText().matchAll(/<Subject (\d+)>/g)].map((x) => +x[1]);
+      return `<Subject ${Math.max(0, ...n) + 1}>`;
+    };
+    const ensureRet = (label, marker, note) => {
+      if (r.retention.some((x) => x.label === label)) return;
+      r.retention.push({ label, context: "", marker, note });
+    };
+    const ensureTask = (t) => { if (!r.summaryTypes.includes(t)) r.summaryTypes.push(t); };
+    let added = 0;
+    for (const m of pending) {
+      let subj = null;
+      if (m.look && !cited(m.look.tag)) {
+        const spec = REFMOD_CONCEPTS[m.concept] || REFMOD_CONCEPTS.identity;
+        subj = spec.subject ? nextSubject() : null;
+        const ctx = { subj, tag: m.look.tag };
+        let text = spec.text(ctx);
+        // A saved appearance goes straight into a subject's line, where it can be edited.
+        const looks = m.appearance.replace(/^with\s+/i, "");
+        if (spec.subject && looks) text = text.replace(/\.\s*$/, "") + `, with ${looks}.`;
+        r.subjectDefs.push({ text, role: null });
+        // Saved retained attributes close the retention note, as their own sentence.
+        let note = spec.note(ctx);
+        if (spec.subject && m.retained) note = `${note} ${m.retained.charAt(0).toUpperCase()}${m.retained.slice(1)}.`;
+        ensureRet(subj || m.look.tag, spec.marker, note);
+        ensureTask(spec.task);
+        added++;
+      } else if (m.look) {
+        // The look is already defined: reuse its subject for the voice.
+        const line = r.subjectDefs.find((d) => d.text.includes(m.look.tag));
+        subj = (line?.text.match(/<Subject \d+>/) || [null])[0];
+      }
+      if (m.voice && !cited(m.voice.tag)) {
+        const vc = m.look ? (m.concept === "singing" ? "singing" : "voice") : m.concept;
+        const spec = REFMOD_CONCEPTS[vc] || REFMOD_CONCEPTS.voice;
+        if (spec.speaker && !subj) {
+          // A voice with no look of its own still needs someone to belong to.
+          subj = nextSubject();
+          r.subjectDefs.push({ text: spec.speaker({ subj, tag: m.voice.tag }), role: null, name: m.subjectName || "" });
+          ensureRet(subj, "fully_preserved", `${subj}'s identity is retained.`);
+        }
+        const ctx = { subj: subj || "<Subject 1>", tag: m.voice.tag, sx: nextSpeaker() };
+        r.subjectDefs.push({ text: spec.text(ctx), role: vc === "voice" ? "timbre" : null,
+          voice: vc === "voice" ? (m.voiceDesc || "") : "" });
+        ensureRet(m.voice.tag, spec.marker, spec.note(ctx));
+        ensureTask(spec.task);
+        added++;
+      }
+    }
+    nameLines();                                  // saved names onto the lines just written
+    this.render();
+    toast(`Drafted ${added} definition line${added === 1 ? "" : "s"} and their retention entries \u2014 read them over`, 5000);
+  }
+
+  /** Lines already exist: resolves to "add", "replace" or null (cancelled).
+   *  With `complete`, every RefMod already has a line, so there is nothing to
+   *  add: it offers "replace", and "keep" (fill `names` blank name boxes)
+   *  when there are names to fill. */
+  askOverwrite({ complete = false, names = 0 } = {}) {
+    return new Promise((resolve) => {
+      const close = (result) => { window.removeEventListener("keydown", onKey); box.remove(); resolve(result); };
+      const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); close(null); } };
+      const box = el("div", { class: "mmh3-conceptover", onmousedown: (e) => { if (e.target === box) close(null); } },
+        el("div", { class: "mmh3-conceptbox", role: "dialog", "aria-label": "Definitions already exist" },
+          el("div", { class: "mmh3-concepthead" },
+            complete ? "Every RefMod already has a definition" : "You already have definitions"),
+          el("div", { class: "mmh3-dim" },
+            complete
+              ? "Start over clears ALL of subject_definitions and retention_analysis, including lines for other media, " +
+                "and drafts them fresh from the RefMods." +
+                (names ? ` Fill names and voices keeps your lines and fills ${names} empty name or voice ` +
+                         `box${names === 1 ? "" : "es"} with what's saved in the library.` : "")
+              : "Add missing keeps every line you have and drafts only the RefMods that don't have one yet. " +
+                "Start over clears ALL of subject_definitions and retention_analysis, including lines for other media, " +
+                "and drafts them fresh from the RefMods."),
+          el("div", { class: "mmh3-conceptbtns" },
+            el("button", { class: "mmh3-btn", onclick: () => close(null) }, "Cancel"),
+            el("button", { class: "mmh3-btn danger", onclick: () => close("replace") }, "Start over"),
+            !complete ? el("button", { class: "mmh3-btn primary", onclick: () => close("add") }, "Add missing")
+              : names ? el("button", { class: "mmh3-btn primary", onclick: () => close("keep") }, "Fill names and voices")
+              : null)));
+      window.addEventListener("keydown", onKey);
+      document.body.append(box);
+    });
+  }
+
+  /** A small dialog over the editor: what is each of these RefMods? Resolves
+   *  to { choice: {uid: concept}, remember } or null when cancelled. */
+  askConcepts(mods) {
+    return new Promise((resolve) => {
+      const choice = {};
+      const rows = mods.map((m) => {
+        const options = m.look ? VISUAL_CONCEPTS : AUDIO_CONCEPTS;
+        choice[m.uid] = options[0];
+        return el("label", { class: "mmh3-conceptrow" },
+          el("span", {}, `\u25c8 ${m.name}`, el("small", {}, m.look ? " (look)" : " (voice)")),
+          el("select", { onchange: (e) => { choice[m.uid] = e.target.value; } },
+            options.map((c) => el("option", { value: c }, CONCEPT_LABEL[c] || c))));
+      });
+      const remember = el("input", { type: "checkbox", checked: true });
+      const close = (result) => { window.removeEventListener("keydown", onKey); box.remove(); resolve(result); };
+      const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); close(null); } };
+      const box = el("div", { class: "mmh3-conceptover", onmousedown: (e) => { if (e.target === box) close(null); } },
+        el("div", { class: "mmh3-conceptbox", role: "dialog", "aria-label": "What are these RefMods?" },
+          el("div", { class: "mmh3-concepthead" }, "What are these RefMods?"),
+          el("div", { class: "mmh3-dim" }, "The library has no concept saved for them, and the wording depends on it."),
+          ...rows,
+          el("label", { class: "mmh3-inline" }, remember, " Save the answers to the library so this isn't asked again"),
+          el("div", { class: "mmh3-conceptbtns" },
+            el("button", { class: "mmh3-btn", onclick: () => close(null) }, "Cancel"),
+            el("button", { class: "mmh3-btn primary", onclick: () => close({ choice, remember: remember.checked }) }, "Draft"))));
+      window.addEventListener("keydown", onKey);
+      document.body.append(box);
+    });
+  }
+
+  /* --- hover peek ------------------------------------------------- */
+
+  peekFor(card, s) {
+    let timer = null;
+    const open = () => {
+      this.closePeek();
+      const box = el("div", { class: "mmh3-peek" });
+      const media = s.preview?.type === "video"
+        ? el("video", { src: s.preview.url, controls: true, autoplay: true,
+            muted: true, loop: true, class: "mmh3-peekmedia" })
+        : s.preview?.type === "audio"
+          ? el("div", {}, this.mediaThumb(s, true),
+              el("audio", { src: s.preview.url, controls: true,
+                style: { width: "100%", height: "28px" } }))
+          : el("img", { src: s.preview?.url, class: "mmh3-peekmedia" });
+      const cites = this.citationCount(s.tag);
+      const r = s.refmod;
+      box.append(media,
+        el("div", { class: "mmh3-peekmeta" },
+          r ? el("div", { class: "mmh3-peekrefmod" },
+                el("span", {}, `\u25c8 RefMod \u00b7 ${r.name}`),
+                el("span", {}, r.role)) : null,
+          el("div", { class: "mmh3-peekrow" },
+            el("span", { class: `mmh3-tagname ${s.cls}` }, s.range || s.tag),
+            el("span", { class: "mmh3-peekcite" + (cites ? "" : " zero") },
+              cites ? `cited ${cites}\u00d7` : "not cited")),
+          el("div", { class: "mmh3-peeksrc" },
+            r ? [r.weight, r.tokens ? `${r.tokens.toLocaleString("en-US")} tokens` : "",
+                 r.pair ? `${r.pair.role} is ${r.pair.tag}` : "", r.draft ? "draft copy" : ""]
+                  .filter(Boolean).join(" \u2022 ")
+              : s.source + (s.note ? ` \u2022 ${s.note.replace(/[<>]/g, "")}` : "")),
+          el("div", { class: "mmh3-peekbtns" },
+            el("button", { class: "mmh3-btn", onclick: () => {
+              this.insert(s.tag); this.closePeek(); } }, "Insert tag"),
+            )));
+
+      const rect = card.getBoundingClientRect();
+      box.style.left = `${Math.min(rect.left, window.innerWidth - 250)}px`;
+      box.style.top = `${rect.bottom + 6}px`;
+      box.addEventListener("mouseenter", () => clearTimeout(this._peekClose));
+      box.addEventListener("mouseleave", () => this.closePeek());
+      document.body.append(box);
+      this._peek = box;
+    };
+    card.addEventListener("mouseenter", () => {
+      clearTimeout(this._peekClose);
+      timer = setTimeout(open, 250);
+    });
+    card.addEventListener("mouseleave", () => {
+      clearTimeout(timer);
+      this._peekClose = setTimeout(() => this.closePeek(), 220);
+    });
+  }
+
+  closePeek() {
+    if (this._peek) { this._peek.remove(); this._peek = null; }
+  }
+
+  /* --- pinning ----------------------------------------------------- */
+
+  togglePin(tag) {
+    if (this.pins.includes(tag)) this.pins = this.pins.filter((t) => t !== tag);
+    else {
+      this.pins = [tag, ...this.pins].slice(0, 3);
+      this.autoPin = null;   // an explicit pin overrides the caret
+    }
+    this.drawPins();
+  }
+
+  /** The tag the caret currently sits inside, if any. */
+  caretTag() {
+    const t = this.lastFocus;
+    if (!t || !t.isConnected || t.selectionStart == null) return null;
+    const pos = t.selectionStart;
+    for (const m of t.value.matchAll(/<(Picture|Video|Audio) \d+>/g)) {
+      if (pos >= m.index && pos <= m.index + m[0].length) return m[0];
+    }
+    return null;
+  }
+
+  syncCaretPin() {
+    const tag = this.caretTag();
+    const known = tag && this.slots.some((s) => s.tag === tag);
+    const next = known ? tag : null;
+    if (next === this.autoPin) return;
+    this.autoPin = next;
+    this.drawPins();
+  }
+
+  drawPins() {
+    if (!this.pinsEl) return;
+    // Chips in the text carry the previews now, so the rail never opens —
+    // it used to widen the body and shove every field sideways.
+    this.pinsEl.replaceChildren();
+    this.pinsEl.parentElement?.classList.remove("haspins");
+    if (true) return;
+    const shown = [];
+    if (this.autoPin && !this.pins.includes(this.autoPin)) shown.push(this.autoPin);
+    shown.push(...this.pins);
+    const list = shown.slice(0, 3)
+      .map((tag) => this.slots.find((s) => s.tag === tag)).filter(Boolean);
+
+    this.overlay.querySelector(".mmh3-body")
+      .classList.toggle("haspins", list.length > 0);
+
+    this.pinsEl.replaceChildren(
+      el("div", { class: "mmh3-pinhead" }, "pinned"),
+      ...list.map((s) => el("div", { class: "mmh3-pincard" },
+        this.mediaThumb(s, true),
+        el("div", { class: "mmh3-pinbar" },
+          el("span", { class: `mmh3-tagname ${s.cls}` }, s.tag),
+          s.tag === this.autoPin && !this.pins.includes(s.tag)
+            ? el("span", { class: "mmh3-auto", title: "Pinned by the caret" }, "auto")
+            : el("span", { class: "mmh3-x", title: "Unpin",
+                onclick: () => this.togglePin(s.tag) }, "\u2715")),
+        s.preview?.type === "audio"
+          ? el("audio", { src: s.preview.url, controls: true,
+              style: { width: "100%", height: "26px" } })
+          : null)),
+      list.length < 3
+        ? el("div", { class: "mmh3-pinempty" },
+            list.length ? "pin up to " + (3 - list.length) + " more"
+              : "hover a reference and pin it, or put the caret in a tag")
+        : null);
+  }
+
+  /* --- the rail ---------------------------------------------------- */
+
+  /** The loader clip marked for editing, if any. */
+  editItem() {
+    const items = (this.bufferMode === "draft" ? this.draftView() : null) || loaderItems(this.node) || [];
+    return items.find((i) => i && i.edit && i.mask && i.enabled !== false) || null;
+  }
+
+  refChips() {
+    const live = this.slots.filter((s) => s.tag);
+    if (!live.length) {
+      // In draft mode, say which set came up empty: the draft's own frozen
+      // snapshot, or the node's live references. "No media" with no source
+      // named is unactionable when two sources are possible.
+      const snap = this.bufferMode === "draft" ? this.draftView() : null;
+      if (snap) {
+        return el("span", { class: "hint" },
+          `This draft's frozen media snapshot holds ${snap.length} ` +
+          `item${snap.length === 1 ? "" : "s"}, but none of them produce a ` +
+          "reference tag \u2014 they may all be switched off. Commit or clear " +
+          "the draft to go back to the node's own media.");
+      }
+      if (this.slots?.refmod) {
+        return el("span", { class: "mmh3-refmodnone",
+          title: "The RefMod Stack connected to this prompt isn't sending anything yet." },
+          "No RefMods loaded");
+      }
+      return el("span", { class: "hint" },
+        "No reference media on this node yet \u2014 use '+ Media loader' or '+ RefMods', or wire " +
+        "loaders into the picture_/video_/audio_ inputs." +
+        (this.bufferMode === "draft"
+          ? " (This draft has no snapshot of its own, so it follows the node.)"
+          : ""));
+    }
+    const cards = live.map((s) => {
+      const ok = this.usable(s);
+      const cites = ok ? this.citationCount(s.tag) : 0;
+      const card = el("div", {
+        class: `mmh3-card ${s.cls}` + (ok ? "" : " unusable"),
+        draggable: ok,
+        title: ok ? `${s.tag} \u2022 ${s.source}` : this.modeNote(s),
+        onclick: () => ok ? this.insert(s.tag) : toast(this.modeNote(s), 3200),
+        ondragstart: (e) => {
+          if (!ok) { e.preventDefault(); return; }
+          e.dataTransfer.setData("text/plain", s.tag);
+          e.dataTransfer.effectAllowed = "copy";
+          this.closePeek();
+        },
+      },
+        this.mediaThumb(s),
+        el("div", { class: "mmh3-cardbar" },
+          el("span", { class: `mmh3-tagname ${s.cls}` }, `${s.kind} ${s.idx}`),
+          ok
+            ? el("span", { class: "mmh3-cite" + (cites ? "" : " zero"),
+                title: cites ? `cited ${cites}\u00d7` : "not cited yet" },
+                cites || "\u2013")
+            : el("span", { class: "mmh3-cite off", title: this.modeNote(s) },
+                "\u2298")),
+        s.copies?.length
+          ? el("span", { class: "mmh3-cardnote",
+              title: `${s.range} \u2014 ${s.copies.length} extra ` +
+                     `${s.copies.length === 1 ? "copy" : "copies"}; citing ${s.tag} is enough` },
+              `\u00d7${s.copies.length + 1}`)
+          : s.note && s.note !== "standalone" && s.note !== "voice"
+          ? el("span", { class: "mmh3-cardnote" },
+              "\u266a\u2192V" + (s.note.match(/\d+/) || [""])[0])
+          : null);
+      if (s.edit && s.kind === "Video") {
+        const it = this.editItem();
+        const thumb = card.querySelector("video.mmh3-thumb");
+        const sprite = it?.mask_info?.sprite;
+        if (thumb && sprite && overlayOn()) {
+          const wrap = el("div", { class: "mmh3-editthumb" });
+          thumb.replaceWith(wrap);
+          wrap.append(thumb);
+          maskOverlay(thumb, wrap, sprite, "contain", { append: true, look: itemLook(it), onMissing: () => card.append(
+            el("span", { class: "mmh3-maskmissing", title: "This clip's mask files are missing: mask it again in " +
+              "the Media Loader, or clear its mask. The next run stops with an error until you do." }, "\u26a0")) })
+            .mirror(!!it.mirror);
+        }
+        card.classList.add("mmh3-editsrc");
+        card.title = `${s.tag} is the clip being edited: only its masked area is regenerated. Cite it the way ` +
+          `H3's editing prompts do: "${s.tag} is the source video for the target video edit." and ` +
+          `"The target video is an edited version of ${s.tag}."`;
+        card.append(el("span", { class: "mmh3-cardbadge mmh3-editbadge" }, "\u25d0"));
+      }
+      if (s.refmod) {
+        card.classList.add("refmod");
+        card.append(el("span", { class: "mmh3-cardbadge", title: `From the RefMod \u201c${s.refmod.name}\u201d` }, "\u25c8"));
+        if (s.refmod.role === "voice" && s.preview?.type === "img")
+          card.append(el("span", { class: "mmh3-cardvoice" }, "\u266a"));
+      }
+      if (ok) this.peekFor(card, s);
+      return card;
+    });
+    // Only worth sorting into groups when RefMods are in the mix: then each
+    // RefMod's look and voice sit together under its name, and the loader's
+    // media under its own.
+    if (!live.some((s) => s.refmod)) return cards;
+    const keyOf = (s) => (s.refmod ? `r:${s.refmod.uid}:${s.refmod.name}` : `m:${(s.source || "").split(" \u2022 ")[0]}`);
+    const out = [];
+    live.forEach((s, i) => {
+      const key = keyOf(s);
+      const last = out[out.length - 1];
+      if (last && last.key === key) { last.cards.push(cards[i]); return; }
+      out.push({ key, s, cards: [cards[i]] });
+    });
+    return out.map((g) => el("div", { class: "mmh3-cardgroup" + (g.s.refmod ? " refmod" : "") },
+      el("div", { class: "mmh3-cardgroupcards" }, ...g.cards),
+      el("div", { class: "mmh3-cardstrip",
+        title: g.s.refmod ? `RefMod \u201c${g.s.refmod.name}\u201d${g.s.refmod.draft ? " (this draft's copy)" : ""}` : g.s.source },
+        g.s.refmod ? `\u25c8 ${g.s.refmod.name}`
+          : (/^draft/i.test(g.s.source || "") ? "Draft media" : (g.s.slotName || "").startsWith("loader:") ? "Media" : "Connected"))));
+  }
+
+  toolBar(extraChips = []) {
+    const camMove = el("select", {},
+      CAMERA_MOVES.map(([k]) => el("option", { value: k }, k)));
+    const camAmp = el("select", {},
+      ["(amplitude)", "with small amplitude", "with large amplitude"]
+        .map((v, i) => el("option", { value: i ? v : "" }, v)));
+    const camSpd = el("select", {},
+      ["(speed)", "at slow speed", "at fast speed"]
+        .map((v, i) => el("option", { value: i ? v : "" }, v)));
+    const camBtn = el("button", { class: "mmh3-btn", onclick: () => {
+      const base = CAMERA_MOVES.find(([k]) => k === camMove.value)[1];
+      this.insert([base, camAmp.value, camSpd.value].filter(Boolean).join(" "));
+    }}, "+ Camera");
+
+    const lang = el("select", {}, LANGS.map((l) => el("option", { value: l }, l)));
+    const spk = el("select", {}, ["S1", "S2", "S3", "S4"]
+      .map((s) => el("option", { value: s }, s)));
+    const diaBtn = el("button", { class: "mmh3-btn", onclick: () =>
+      this.insert(`(${spk.value}) says: <d>[${lang.value}] </d>`) }, "+ Dialogue");
+    const voBtn = el("button", { class: "mmh3-btn", title: "Voiceover (guide §4.4)",
+      onclick: () => this.insert(
+        `(${spk.value}) says in an off-screen voiceover: <d>[${lang.value}] </d> ` +
+        "while his lips remain completely closed.") }, "+ Voiceover");
+
+    const timeIn = el("input", {
+      type: "number", min: "0", max: "900", step: "0.1", value: "3.0",
+      title: "Cut time in seconds \u2014 scroll or use the arrows to step by 0.1s",
+      dataset: { noinsert: "1" }, style: { width: "84px" },
+    });
+    // Let the wheel step the value without scrolling the form behind it.
+    timeIn.addEventListener("wheel", (e) => {
+      if (document.activeElement !== timeIn) return;
+      e.preventDefault();
+      const v = parseFloat(timeIn.value) || 0;
+      const next = Math.max(0, Math.round((v + (e.deltaY < 0 ? 0.1 : -0.1)) * 10) / 10);
+      timeIn.value = next.toFixed(1);
+    }, { passive: false });
+
+    const shotBtn = el("button", { class: "mmh3-btn",
+      title: "Insert the next [Shot N]. Shots after the first use the cut time " +
+        "from the stepper, formatted as At MM:SS.mmm",
+      onclick: () => {
+        const field = this.lastFocus;
+        const t = field?.value || "";
+        const n = Math.max(0, ...[...t.matchAll(/\[Shot (\d+)\]/g)].map((m) => +m[1])) + 1;
+        // "appears in ..." fields want a bare shot label, not a cut scaffold.
+        if (field?.dataset?.shotlist) {
+          const sep = t.trim() && !/[\s,]$/.test(t.slice(0, field.selectionStart ?? t.length))
+            ? ", " : "";
+          this.insert(`${sep}[Shot ${n}]`);
+          return;
+        }
+        if (n === 1) { this.insert("[Shot 1] ", { newline: true }); return; }
+        const sec = parseFloat(timeIn.value);
+        if (!isFinite(sec) || sec <= 0) {
+          toast("Set a cut time above 0 first");
+          timeIn.focus();
+          return;
+        }
+        this.insert(`[Shot ${n}] At ${fmtTimestamp(sec)}, the shot cuts to `,
+          { newline: true });
+        // Advance the stepper past the cut just placed, ready for the next one.
+        timeIn.value = (Math.round((sec + 3) * 10) / 10).toFixed(1);
+      } }, "+ Shot");
+    timeIn.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); shotBtn.click(); }
+    });
+
+    const styleSel = el("select", {},
+      [el("option", { value: "" }, "(style)"),
+        ...STYLES.map((s) => el("option", { value: s }, s))]);
+    styleSel.addEventListener("change", () => {
+      if (styleSel.value) { this.insert(styleSel.value + ", "); styleSel.value = ""; }
+    });
+
+    return el("div", { class: "mmh3-chipbar" },
+      el("div", { class: "mmh3-chips" }, this.refChips()),
+      extraChips.length
+        ? el("div", { class: "mmh3-subjrow" }, extraChips) : null,
+      el("div", { class: "mmh3-tools" },
+        timeIn, shotBtn, camMove, camAmp, camSpd, camBtn, styleSel),
+      this.dialogueSlot = el("div", { class: "mmh3-dialogslot" },
+        this.dialogueRow(lang)),
+      this.tagRow(),
+      this.phraseRow());
+  }
+
+  /* --- delivery tags: community findings, inserted inside <d> -------- */
+
+  /** The tag picker row. Deliberately its own row rather than an extension of
+   *  the dialogue row: that one already grows with every speaker, and 24 tags
+   *  need a picker, not buttons. Sits directly under dialogue because these
+   *  tags belong inside <d>, and insert() parks the caret before </d>. */
+  tagRow() {
+    const groups = [...new Set(DELIVERY_TAGS.map((t) => t.group))];
+    this.tagGroup = this.tagGroup || groups[0];
+
+    this.tagGroupEl = el("select", { class: "mmh3-phrasecat",
+      title: "Filter delivery tags by kind",
+      onchange: () => { this.tagGroup = this.tagGroupEl.value;
+        this.drawTags(); } });
+    this.tagEl = el("select", { class: "mmh3-phrasesel",
+      onchange: () => this.showTagPeek(),
+      onmouseenter: () => this.showTagPeek(),
+      onmouseleave: () => this.hideTagPeek(),
+      onmousedown: () => this.hideTagPeek(),
+      onblur: () => this.hideTagPeek() });
+
+    this.tagBar = el("div", { class: "mmh3-tools mmh3-phraserow" },
+      el("span", { class: "mmh3-toollabel" }, "Delivery:"),
+      this.tagGroupEl, this.tagEl,
+      el("button", { class: "mmh3-btn",
+        title: "Insert the selected tag at the caret. Tags belong inside a " +
+               "<d> block \u2014 insert a dialogue line first.",
+        onclick: () => this.insertTag() }, "insert"));
+    this.drawTags();
+    return this.tagBar;
+  }
+
+  selectedTag() {
+    return DELIVERY_TAGS.find((t) => t.tag === this.tagEl?.value) || null;
+  }
+
+  drawTags() {
+    if (!this.tagGroupEl) return;
+    this.hideTagPeek();
+    const groups = [...new Set(DELIVERY_TAGS.map((t) => t.group))];
+    this.tagGroupEl.replaceChildren(...groups.map((g) =>
+      el("option", { value: g, selected: g === this.tagGroup }, g)));
+    const list = DELIVERY_TAGS.filter((t) => t.group === this.tagGroup);
+    this.tagEl.replaceChildren(...list.map((t) =>
+      el("option", { value: t.tag, title: t.what },
+        `${t.tag}\u2002\u2014\u2002${t.what.split(".")[0]}`)));
+  }
+
+  insertTag() {
+    const t = this.selectedTag();
+    if (!t) return;
+    if (t.wrap) {
+      const close = `</${t.tag.slice(1)}`;      // <whisper> -> </whisper>
+      this.insert(t.tag, { wrap: close });
+    } else {
+      this.insert(t.tag);
+    }
+  }
+
+  /** Show the example on hover: the picker only has room for the tag and a
+   *  few words, and the example is what tells you how it reads in a line. */
+  showTagPeek() {
+    this.hideTagPeek();
+    const t = this.selectedTag();
+    if (!t) return;
+    const box = el("div", { class: "mmh3-phrasepeek" },
+      el("div", { class: "mmh3-phrasepeekhead" },
+        el("span", {}, t.tag),
+        el("span", { class: "mmh3-phrasepeekcat" }, t.group)),
+      el("div", { class: "mmh3-phrasepeektext" }, ...deliverySpans(t.ex)),
+      el("div", { class: "mmh3-tagpeekwhat" }, t.what));
+    document.body.append(box);
+    const r = this.tagEl.getBoundingClientRect();
+    const b = box.getBoundingClientRect();
+    box.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - b.width - 8))}px`;
+    box.style.top = r.top - b.height - 6 >= 8
+      ? `${r.top - b.height - 6}px`
+      : `${r.bottom + 6}px`;
+    this._tagPeek = box;
+  }
+
+  hideTagPeek() {
+    this._tagPeek?.remove();
+    this._tagPeek = null;
+  }
+
+  /* --- phrases: reusable fragments, saved server-side ---------------- */
+
+  async loadPhrases() {
+    this.phraseRouteMissing = false;
+    try {
+      const resp = await api.fetchApi("/minimax_h3/phrases");
+      if (!resp.ok) {
+        this.phraseRouteMissing = resp.status === 404 || resp.status === 405;
+        throw new Error("unavailable");
+      }
+      const data = await resp.json();
+      this.phrases = Array.isArray(data.phrases) ? data.phrases : [];
+      this.phraseCats = data.categories || [];
+    } catch (e) {
+      this.phrases = [];
+      this.phraseCats = [];
+    }
+    this.drawPhrases();
+  }
+
+  /** Category picker, phrase picker, insert, and add/remove. */
+  phraseRow() {
+    this.phrases = this.phrases || [];
+    this.phraseCats = this.phraseCats || [];
+    this.phraseCatEl = el("select", { class: "mmh3-phrasecat",
+      title: "Filter phrases by category",
+      onchange: () => { this.phraseCat = this.phraseCatEl.value;
+        this.drawPhrases(); } });
+    this.phraseEl = el("select", { class: "mmh3-phrasesel",
+      onchange: () => this.showPhrasePeek(),
+      onmouseenter: () => this.showPhrasePeek(),
+      onmouseleave: () => this.hidePhrasePeek(),
+      // Opening the list would leave the popover floating over it.
+      onmousedown: () => this.hidePhrasePeek(),
+      onblur: () => this.hidePhrasePeek() });
+    this.phraseBar = el("div", { class: "mmh3-tools mmh3-phraserow" });
+    this.drawPhraseBar();
+    this.drawPhrases();
+    this.loadPhrases();
+    return this.phraseBar;
+  }
+
+  /** The row in its normal state, or asking to confirm a delete. Confirming
+   *  inline keeps it with the rest of the pack — no browser dialogs. */
+  drawPhraseBar() {
+    if (!this.phraseBar) return;
+    if (this.phraseConfirm) {
+      const p = this.phraseConfirm;
+      this.phraseBar.replaceChildren(
+        el("span", { class: "mmh3-toollabel" }, "Phrases:"),
+        el("span", { class: "mmh3-phrasewarn" }, `Delete \u201c${p.name}\u201d?`),
+        // The normal row relies on the picker to take up the slack; this one
+        // has no flexible control, so it needs a growing spacer of its own.
+        el("span", { class: "mmh3-toolgrow" }),
+        el("button", { class: "mmh3-btn mmh3-danger",
+          onclick: () => this.confirmDeletePhrase() }, "Delete"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => { this.phraseConfirm = null; this.drawPhraseBar(); } },
+          "Cancel"));
+      return;
+    }
+    this.phraseBar.replaceChildren(
+      el("span", { class: "mmh3-toollabel" }, "Phrases:"),
+      this.phraseCatEl, this.phraseEl,
+      el("button", { class: "mmh3-btn",
+        title: "Insert the selected phrase at the caret",
+        onclick: () => this.insertPhrase() }, "+ Phrase"),
+      el("span", { class: "mmh3-toolspace" }),
+      el("button", { class: "mmh3-btn",
+        title: "Save the selected text as a phrase",
+        onclick: () => this.newPhrase() }, "+ New"),
+      el("button", { class: "mmh3-btn mmh3-danger",
+        title: "Delete the selected phrase",
+        onclick: () => this.deletePhrase() }, "Delete"));
+  }
+
+  drawPhrases() {
+    if (!this.phraseCatEl) return;
+    this.hidePhrasePeek();
+    if (this.phraseConfirm) return;      // the row is asking something
+    const cats = this.phraseCats || [];
+    const cat = this.phraseCat || "";
+    this.phraseCatEl.replaceChildren(
+      el("option", { value: "", selected: cat === "" }, "all categories"),
+      ...cats.map((c) => el("option", { value: c, selected: c === cat }, c)));
+    const list = (this.phrases || [])
+      .filter((p) => !cat || (p.category || "") === cat);
+    this.phraseEl.replaceChildren(
+      ...(list.length
+        ? list.map((p) => el("option",
+            { value: p.id, title: p.text.slice(0, 300) }, p.name))
+        : [el("option", { value: "" }, this.phraseRouteMissing
+            ? "restart ComfyUI to use phrases"
+            : "no phrases saved")]));
+    const empty = list.length === 0;
+    this.phraseEl.disabled = empty;
+    [...(this.phraseBar?.querySelectorAll("button") || [])].forEach((b) => {
+      if (b.textContent === "+ Phrase" || b.textContent === "Delete") {
+        b.disabled = empty;
+      }
+    });
+  }
+
+  /** Show the whole phrase on hover — the picker only has room for its name,
+   *  and the text is the part you actually need to check before inserting. */
+  showPhrasePeek() {
+    this.hidePhrasePeek();
+    const p = this.selectedPhrase();
+    if (!p || !p.text) return;
+    const box = el("div", { class: "mmh3-phrasepeek" },
+      el("div", { class: "mmh3-phrasepeekhead" },
+        el("span", {}, p.name),
+        p.category ? el("span", { class: "mmh3-phrasepeekcat" }, p.category) : null),
+      el("div", { class: "mmh3-phrasepeektext" }, p.text));
+    document.body.append(box);
+    const r = this.phraseEl.getBoundingClientRect();
+    const b = box.getBoundingClientRect();
+    box.style.left = `${Math.max(8, Math.min(r.left, window.innerWidth - b.width - 8))}px`;
+    // Prefer above the picker, since the rows below it are the editor body.
+    box.style.top = r.top - b.height - 6 >= 8
+      ? `${r.top - b.height - 6}px`
+      : `${r.bottom + 6}px`;
+    this._phrasePeek = box;
+  }
+
+  hidePhrasePeek() {
+    this._phrasePeek?.remove();
+    this._phrasePeek = null;
+  }
+
+  selectedPhrase() {
+    const id = this.phraseEl?.value;
+    return (this.phrases || []).find((p) => p.id === id) || null;
+  }
+
+  insertPhrase() {
+    const p = this.selectedPhrase();
+    if (!p) return;
+    // A phrase saved from a multi-line selection would otherwise carry cuts
+    // into the description, since the model reads a line break as a new shot.
+    const flat = p.text.replace(/\s*\n+\s*/g, " ").trim();
+    this.insert(flat);
+    if (flat !== p.text.trim()) {
+      toast("Line breaks in that phrase were flattened \u2014 they read as " +
+            "shot cuts", 4500);
+    }
+  }
+
+  closeCtx() {
+    this._ctxMenu?.remove();
+    this._ctxMenu = null;
+  }
+
+  openCtx(x, y, box, a, b) {
+    this.closeCtx();
+    const text = box.value.slice(a, b);
+    const item = (label, fn) => el("div", { class: "mmh3-ctxitem",
+      onclick: () => { this.closeCtx(); fn(); } }, label);
+    const menu = el("div", { class: "mmh3-ctxmenu" },
+      item("Save selection as phrase\u2026", () => this.phraseDialog(text)),
+      item("Copy", async () => {
+        const ok = await copyText(text);
+        if (!ok) toast("Couldn't reach the clipboard", 4000);
+      }),
+      item("Cut", async () => {
+        if (await copyText(text)) editField(box, a, b, "");
+        else toast("Couldn't reach the clipboard", 4000);
+      }),
+      item("Paste", async () => {
+        // Pages may only read the clipboard on https or localhost, and the
+        // browser can ask first; Ctrl+V works everywhere.
+        let clip = "";
+        try { clip = await navigator.clipboard.readText(); } catch (e) { /* not allowed here */ }
+        if (clip) editField(box, a, b, clip);
+        else toast("Couldn't read text from the clipboard \u2014 press Ctrl+V instead", 4500);
+      }),
+      item("Remove", () => editField(box, a, b, "")));
+    document.body.append(menu);
+    // Keep it on screen when the click lands near an edge.
+    const r = menu.getBoundingClientRect();
+    menu.style.left = `${Math.min(x, window.innerWidth - r.width - 8)}px`;
+    menu.style.top = `${Math.min(y, window.innerHeight - r.height - 8)}px`;
+    this._ctxMenu = menu;
+  }
+
+  /** Text currently selected in a field of this editor, if any. */
+  selectedText() {
+    const box = document.activeElement && this.overlay.contains(document.activeElement)
+      ? document.activeElement : this.lastFocus;
+    if (!box || typeof box.value !== "string") return "";
+    const a = box.selectionStart ?? 0;
+    const b = box.selectionEnd ?? 0;
+    return b > a ? box.value.slice(a, b) : "";
+  }
+
+  newPhrase() {
+    this.phraseDialog(this.selectedText());
+  }
+
+  /** Compose a phrase. Opens prefilled from a selection, or empty and focused
+   *  so there's always somewhere to type — reaching for the whole field when
+   *  nothing was selected surprised people. */
+  phraseDialog(initial) {
+    const text = el("textarea", { rows: 5, class: "mmh3-phrasetext",
+      placeholder: "The wording to save\u2026" });
+    text.value = initial || "";
+    const name = el("input", { type: "text", placeholder: "Name",
+      value: (initial || "").trim().slice(0, 40) });
+
+    const known = [...(this.phraseCats || [])];
+    const catNew = el("input", { type: "text", placeholder: "New category name",
+      style: { display: "none" } });
+    const cat = el("select", { class: "mmh3-savecat",
+      onchange: () => {
+        const isNew = cat.value === "\u0000new";
+        catNew.style.display = isNew ? "" : "none";
+        if (isNew) setTimeout(() => catNew.focus(), 0);
+      } },
+      el("option", { value: "" }, "No category"),
+      known.map((c) => el("option",
+        { value: c, selected: c === this.phraseCat }, c)),
+      el("option", { value: "\u0000new" }, "(new category\u2026)"));
+
+    const close = () => {
+      window.removeEventListener("keydown", onKey);
+      overlay.remove();
+    };
+    const commit = () => {
+      const body = text.value.trim();
+      if (!body) { text.focus(); toast("The phrase is empty", 3000); return; }
+      if (!name.value.trim()) { name.focus(); toast("Give it a name", 3000); return; }
+      this.savePhrase({
+        name: name.value.trim(),
+        category: (cat.value === "\u0000new" ? catNew.value : cat.value).trim(),
+        text: body,
+      });
+      close();
+    };
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); close(); }
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) commit();
+    };
+    window.addEventListener("keydown", onKey);
+
+    const overlay = el("div", { class: "mmh3-overlay mmh3-phraseover" },
+      el("div", { class: "mmh3-phrasemodal" },
+        el("div", { class: "mmh3-head" },
+          el("div", { class: "mmh3-title" }, "Save a phrase"),
+          el("button", { class: "mmh3-x", onclick: close }, "\u2715")),
+        el("div", { class: "mmh3-phrasebody" },
+          el("label", {}, "Phrase"), text,
+          el("div", { class: "mmh3-saverow" }, name, cat, catNew)),
+        el("div", { class: "mmh3-phrasefoot" },
+          el("span", { class: "mmh3-clearnote" },
+            "Ctrl+Enter saves \u00b7 Esc closes"),
+          el("div", { class: "mmh3-clearactions" },
+            el("button", { class: "mmh3-btn primary", onclick: commit }, "Save"),
+            el("button", { class: "mmh3-btn", onclick: close }, "Cancel")))));
+    document.body.append(overlay);
+    (initial ? name : text).focus();
+  }
+
+  async savePhrase(entry) {
+    if (!entry.name) { toast("Give the phrase a name", 3500); return; }
+    try {
+      const resp = await postApi("/minimax_h3/phrases/save", {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(entry),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.error || routeError(resp, "save failed"));
+      this.phraseCat = entry.category || this.phraseCat;
+      await this.loadPhrases();
+      toast(`Saved "${entry.name}"`);
+    } catch (e) {
+      toast(`Couldn't save the phrase: ${e.message}`, 5000);
+    }
+  }
+
+  deletePhrase() {
+    const p = this.selectedPhrase();
+    if (!p) return;
+    this.hidePhrasePeek();
+    this.phraseConfirm = p;
+    this.drawPhraseBar();
+  }
+
+  async confirmDeletePhrase() {
+    const p = this.phraseConfirm;
+    this.phraseConfirm = null;
+    this.drawPhraseBar();
+    if (!p) return;
+    try {
+      const resp = await postApi("/minimax_h3/phrases/delete", {
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: p.id }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.error || routeError(resp, "delete failed"));
+      await this.loadPhrases();
+      toast(`Deleted "${p.name}"`);
+    } catch (e) {
+      toast(`Couldn't delete the phrase: ${e.message}`, 5000);
+    }
+  }
+
+  /** Speaker IDs already used in the prompt, in numeric order. */
+  usedSpeakers() {
+    const text = JSON.stringify(this.state || {});
+    const found = new Set();
+    for (const m of text.matchAll(/\((S\d+(?:\s*,\s*S\d+)*)\)/g)) {
+      for (const id of m[1].split(",")) found.add(id.trim());
+    }
+    return [...found].sort((a, b) => (+a.slice(1)) - (+b.slice(1)));
+  }
+
+  /** Dialogue controls: language, one button per speaker already in use plus
+   *  the next unused ID, a voiceover toggle, and the two continuity markers.
+   *  Speaker IDs follow the target video's speaking order, so offering a
+   *  fixed S1-S4 would invent numbers the prompt has no use for. */
+  /** Rebuild ONLY the dialogue row.
+   *
+   *  insert() can't call render(): a full rebuild replaces the textareas and
+   *  throws away the caret it just placed inside <d>…</d>. So the speaker
+   *  buttons, the pair button and the voiceover state all went stale the
+   *  moment they mattered — you clicked "+ (S1)" and the row kept offering
+   *  "+ (S1)" until some unrelated event forced a render. Swapping just this
+   *  row leaves the focused field untouched. */
+  refreshDialogueRow() {
+    if (!this.dialogueSlot?.isConnected || !this.dialogueLang) return;
+    try {
+      this.dialogueSlot.replaceChildren(this.dialogueRow(this.dialogueLang));
+    } catch (err) {
+      console.error("[MiniMaxH3 PromptBuilder] dialogue row refresh failed:", err);
+    }
+  }
+
+  /* --- right-click a tag: replace, swap or remove ------------------- */
+
+  /** Reference mode: each voice-timbre line ties a speaker ID to its
+   *  subject, that subject's name, the audio tag and, when filled in, a
+   *  description of the voice. { S1: { audio, subj, sx, name, voice } } */
+  speakerBindings() {
+    const binds = {};
+    if (this.state.mode !== "REF") return binds;
+    const names = subjectNames(this.state);
+    for (const d of this.state.ref?.subjectDefs || []) {
+      const b = !d.off && voiceBinding(d.text);
+      if (!b || binds[b.sx]) continue;
+      const named = b.subj ? Object.values(names).find((n) => n.tag === b.subj) : null;
+      binds[b.sx] = { ...b, name: named ? named.name : "", voice: oneLine(d.voice) };
+    }
+    return binds;
+  }
+
+  /** Every string in this mode's prompt a tag can sit in. */
+  tagTexts() {
+    const st = this.state, out = [];
+    const add = (obj, key, where = "") => { if (obj && typeof obj[key] === "string") out.push({ obj, key, where }); };
+    if (st.mode === "REF") {
+      const r = st.ref;
+      (r.subjectDefs || []).forEach((d) => add(d, "text", "def"));
+      ["summaryText", "styleLine", "detail", "soundscape", "music"].forEach((k) => add(r, k));
+      (r.retention || []).forEach((row) => { add(row, "label", "label"); add(row, "context"); add(row, "note"); });
+    } else {
+      ["imd", "soundscape", "music"].forEach((k) => add(st, k));
+    }
+    return out;
+  }
+
+  /** The tag under a right-click: read off the painted chips where the
+   *  field has them, else from where the click put the caret. */
+  tagUnderPointer(e, box) {
+    const toks = tagTokens(box.value);
+    if (!toks.length) return null;
+    const mirror = box.closest(".mmh3-chipwrap")?.querySelector(".mmh3-chipmirror");
+    if (mirror) {
+      const chips = [...mirror.querySelectorAll(".mmh3-reftag[data-tag]")];
+      const hit = chips.find((c) => {
+        const r = c.getBoundingClientRect();
+        return e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+      });
+      if (!hit) return null;
+      const same = toks.filter((t) => sameTok(t.tok, hit.dataset.tag));
+      const k = chips.filter((c) => sameTok(c.dataset.tag, hit.dataset.tag)).indexOf(hit);
+      return same[Math.max(0, Math.min(k, same.length - 1))] || null;
+    }
+    const a = box.selectionStart ?? -1, b = box.selectionEnd ?? a;
+    if (a < 0) return null;
+    return toks.find((t) => a >= t.start && a <= t.end && b <= t.end) || null;
+  }
+
+  /** Nothing in the prompt cites it. A subject's own definition line and a
+   *  retention label don't count as citing it. */
+  tagUnused(tok, texts = this.tagTexts()) {
+    for (const t of texts) {
+      if (t.where === "label" || (isSpk(tok) && t.where === "def")) continue;
+      const v = t.obj[t.key] || "";
+      let n = countTok(v, tok);
+      if (t.where === "def" && tok.startsWith("<Subject") && v.trim().startsWith(tok)) n -= 1;
+      if (n > 0) return false;
+    }
+    return true;
+  }
+
+  /** Other tags of the same kind, unused ones first. */
+  tagChoices(tok) {
+    const cls = tagClass(tok), texts = this.tagTexts(), list = [];
+    if (cls === "Name") {
+      for (const n of Object.values(subjectNames(this.state)))
+        list.push({ tok: NAME_PREFIX + n.name, sub: n.tag, slot: this.subjectInfo(n.tag)?.slot || null, initial: n.name[0] });
+    } else if (cls === "Subject") {
+      const seen = new Set();
+      for (const d of this.state.ref?.subjectDefs || []) {
+        const m = (d.text || "").match(/^\s*(<Subject \d+>)/);
+        if (!m || seen.has(m[1])) continue;
+        seen.add(m[1]);
+        const nm = (d.name || "").trim();
+        list.push({ tok: m[1], sub: nm || "no name", slot: this.subjectInfo(m[1])?.slot || null, initial: nm ? nm[0] : "S" });
+      }
+    } else if (cls === "Speaker") {
+      // Voice lines say who each speaker is; group tags only offer groups.
+      const single = spkIds(tok).length === 1, bindings = {}, names = subjectNames(this.state);
+      for (const d of this.state.ref?.subjectDefs || []) {
+        const b = !d.off && voiceBinding(d.text);
+        if (b && !bindings[b.sx]) bindings[b.sx] = b;
+      }
+      const seen = new Map();
+      for (const t of texts) for (const k of tagTokens(t.obj[t.key] || "")) {
+        if (!isSpk(k.tok)) continue;
+        const ids = spkIds(k.tok);
+        if (single && ids.length !== 1) continue;
+        if (!seen.has(spkTok(ids))) seen.set(spkTok(ids), ids);
+      }
+      if (single) Object.keys(bindings).forEach((sx) => { if (!seen.has(`(${sx})`)) seen.set(`(${sx})`, [sx]); });
+      for (const [norm, ids] of seen) {
+        const b = ids.length === 1 ? bindings[ids[0]] : null;
+        const named = b?.subj ? Object.values(names).find((n) => n.tag === b.subj) : null;
+        list.push({ tok: norm, sub: ids.length > 1 ? "speaking together" : (named ? named.name : b?.subj || "no voice line"),
+          slot: b?.subj ? this.subjectInfo(b.subj)?.slot || null : null, initial: ids.join("+") });
+      }
+      if (single) {
+        const used = new Set([...seen.values()].flat());
+        let i = 1;
+        while (used.has(`S${i}`)) i++;
+        list.push({ tok: `(S${i})`, sub: "new speaker", slot: null, initial: `S${i}`, fresh: true });
+      }
+    } else {
+      for (const s of this.slots || []) {
+        if (!s.tag || !s.tag.startsWith(`<${cls} `)) continue;
+        const src = s.refmod?.name || String(s.source || "").split("•").pop().trim() || s.note || "";
+        list.push({ tok: s.tag, sub: src, slot: s, initial: cls.slice(0, 3).toUpperCase() });
+      }
+    }
+    return list.filter((o) => !sameTok(o.tok, tok))
+      .map((o) => ({ ...o, unused: !o.fresh && this.tagUnused(o.tok, texts) }))
+      .sort((a, b) => b.unused - a.unused);
+  }
+
+  /** Carry out a choice from the tag menu; returns what happened. */
+  applyTagEdit(box, hit, scope, mode, target) {
+    const tok = hit.tok;
+    const swap = mode === "swap" && target != null && scope !== "this";
+    const named = tagClass(tok) === "Name" ? lookupName(subjectNames(this.state), tok.slice(1)) : null;
+    const back = named ? NAME_PREFIX + named.name : isSpk(tok) ? spkTok(spkIds(tok)) : tok;
+    const verb = target == null ? "Removed" : swap ? "Swapped" : "Replaced";
+    const what = target == null ? back : swap ? `${back} and ${target}` : `${back} with ${target}`;
+    // A speaker's name and voice clause go with its ID — except when swapping
+    // IDs everywhere, which renumbers the voice lines too and changes nobody.
+    const oneSpk = isSpk(tok) && spkIds(tok).length === 1 && (target == null || spkIds(target).length === 1);
+    const ctx = oneSpk && !(scope === "all" && swap) ? { bindings: this.speakerBindings(), prefix: NAME_PREFIX } : null;
+    if (scope === "this") {
+      if (ctx) {
+        const v = box.value;
+        let s0 = hit.start, e0 = hit.end;
+        const pre = v.slice(0, s0).match(new RegExp(`${reEsc(NAME_PREFIX)}[A-Za-z][\\w-]* $`));
+        if (pre) s0 -= pre[0].length;
+        const post = v.slice(e0).match(/^, in the [^<\n]+? referenced from <Audio \d+>,/);
+        if (post) e0 += post[0].length;
+        const text = rewriteTokens(v.slice(s0, e0), tok, target, false, back, ctx);
+        const r = text === "" ? tidyRange(v, s0, e0) : { start: s0, end: e0 };
+        editField(box, r.start, r.end, text);
+      } else {
+        const r = target == null ? tidyRange(box.value, hit.start, hit.end) : hit;
+        editField(box, r.start, r.end, target ?? "");
+      }
+      this.lastFocus = box;
+      return `${verb} ${what}`;
+    }
+    if (scope === "field") {
+      const v = box.value, n = countTok(v, tok) + (swap ? countTok(v, target) : 0);
+      editField(box, 0, v.length, rewriteTokens(v, tok, target, swap, back, ctx));
+      this.lastFocus = box;
+      return `${verb} ${what} in this field (${n})`;
+    }
+    let n = 0, dropped = 0;
+    const r = this.state.ref;
+    if (target == null && tok.startsWith("<") && this.state.mode === "REF") {
+      // Removing a label everywhere takes the lines that define it too, or
+      // they'd be left reading "is the man in…".
+      const before = r.subjectDefs.length + r.retention.length;
+      r.subjectDefs = r.subjectDefs.filter((d) => !(d.text || "").trim().startsWith(tok));
+      r.retention = r.retention.filter((row) => row.label !== tok);
+      dropped = before - r.subjectDefs.length - r.retention.length;
+    }
+    for (const t of this.tagTexts()) {
+      const v = t.obj[t.key] || "";
+      const c = countTok(v, tok) + (swap ? countTok(v, target) : 0);
+      if (!c) continue;
+      n += c;
+      t.obj[t.key] = rewriteTokens(v, tok, target, swap, back, ctx);
+    }
+    this.render();
+    return `${verb} ${what} everywhere (${n})` +
+      (dropped ? ` and deleted ${dropped} line${dropped === 1 ? "" : "s"} defining it` : "");
+  }
+
+  /** The tag menu: other tags of the same kind to put in its place, how
+   *  far the change reaches, and Remove. */
+  openTagMenu(x, y, box, hit) {
+    this.closeTagMenu();
+    this.chipLeave();
+    this.closeCtx();
+    const tok = hit.tok, cls = tagClass(tok);
+    const st = { scope: "this", mode: "replace" };
+    const host = this.overlay.querySelector(".mmh3-modal") || document.body;
+    const menu = el("div", { class: "mmh3-tagpick", role: "dialog", "aria-label": `Replace ${tok}` });
+    const chipCls = cls === "Name" || cls === "Subject" ? "subj" : cls === "Speaker" ? "spk" : (this.slotFor(tok)?.cls || "unknown");
+    const thumb = (o) => {
+      const wrap = el("span", { class: "mmh3-tagpickthumb" });
+      if (o.slot?.preview?.url) wrap.append(this.mediaThumb(o.slot));
+      else wrap.append(o.initial || "?");
+      if (o.unused || o.fresh) wrap.append(el("span", { class: "mmh3-tagpickun",
+        title: o.fresh ? "The next speaker ID not used anywhere yet" : "Nothing in the prompt cites this yet" }, o.fresh ? "new" : "unused"));
+      return wrap;
+    };
+    const place = () => {
+      const pr = (menu.offsetParent || document.body).getBoundingClientRect();
+      const w = menu.offsetWidth, h = menu.offsetHeight;
+      let left = x - pr.left, top = y - pr.top + 8;
+      left = Math.max(8, Math.min(left, pr.width - w - 8));
+      if (top + h > pr.height - 8) top = Math.max(8, y - pr.top - h - 8);
+      menu.style.left = `${left}px`;
+      menu.style.top = `${top}px`;
+    };
+    const paint = () => {
+      const texts = this.tagTexts();
+      const inField = countTok(box.value, tok);
+      const everywhere = texts.reduce((n, t) => n + countTok(t.obj[t.key] || "", tok), 0);
+      const choices = this.tagChoices(tok);
+      const seg = (key, val, label, disabled = false, title = "") => el("button", {
+        type: "button", class: st[key] === val ? "on" : "", disabled, title,
+        onclick: (e) => { e.stopPropagation(); st[key] = val; if (st.scope === "this") st.mode = "replace"; paint(); },
+      }, label);
+      const go = (target) => {
+        const msg = this.applyTagEdit(box, hit, st.scope, st.mode, target);
+        this.closeTagMenu();
+        toast(msg, 3500);
+      };
+      let note = st.mode === "swap" ? "Swap exchanges both tags" : "Unused tags first";
+      if (st.scope === "all" && tok.startsWith("<") && this.state.mode === "REF") {
+        const r = this.state.ref;
+        const lines = r.subjectDefs.filter((d) => (d.text || "").trim().startsWith(tok)).length +
+          r.retention.filter((row) => row.label === tok).length;
+        if (lines) note = `Remove also deletes the ${lines} line${lines === 1 ? "" : "s"} defining it`;
+      }
+      menu.replaceChildren(
+        el("div", { class: "mmh3-tagpickhead" },
+          el("span", { class: `mmh3-reftag ${chipCls} mmh3-tagpicktag` }, tok),
+          el("span", { class: "mmh3-tagpicknote" }, TAG_CLASS_LABEL[cls]),
+          el("span", { class: "mmh3-tagpickgrow" }),
+          el("button", { type: "button", class: "mmh3-btn ghost", title: "Close", onclick: () => this.closeTagMenu() }, "✕")),
+        el("div", { class: "mmh3-tagpickrow" },
+          el("span", { class: "mmh3-tagpicklbl" }, "Apply to"),
+          el("span", { class: "mmh3-tagseg" },
+            seg("scope", "this", "This tag"),
+            seg("scope", "field", `Field (${inField})`),
+            seg("scope", "all", `Everywhere (${everywhere})`))),
+        el("div", { class: "mmh3-tagpickrow" },
+          el("span", { class: "mmh3-tagpicklbl" }, "Action"),
+          el("span", { class: "mmh3-tagseg" },
+            seg("mode", "replace", "Replace"),
+            seg("mode", "swap", "Swap", st.scope === "this",
+              st.scope === "this" ? "Swap needs Field or Everywhere — on one tag it's the same as Replace"
+                : "Exchange the two tags"))),
+        choices.length
+          ? el("div", { class: "mmh3-tagpickgrid" }, choices.map((o) => el("button", {
+              type: "button", class: "mmh3-tagpickopt",
+              title: `${st.mode === "swap" && st.scope !== "this" ? "Swap with" : "Replace with"} ${o.tok}`,
+              onclick: () => go(o.tok) },
+              thumb(o),
+              el("span", { class: "mmh3-tagpicknm" }, o.tok),
+              el("span", { class: "mmh3-tagpicksub" }, o.sub))))
+          : el("div", { class: "mmh3-tagpicknone" }, `No other ${TAG_CLASS_LABEL[cls]} to put in its place.`),
+        el("div", { class: "mmh3-tagpickfoot" },
+          el("button", { type: "button", class: "mmh3-btn danger", onclick: () => go(null) }, "Remove"),
+          el("span", { class: "mmh3-tagpicknote" }, note)));
+      place();
+    };
+    host.append(menu);
+    paint();
+    const onDown = (e) => { if (!menu.contains(e.target)) this.closeTagMenu(); };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); this.closeTagMenu(); } };
+    document.addEventListener("mousedown", onDown, true);
+    window.addEventListener("keydown", onKey, true);
+    this._tagMenu = { menu, onDown, onKey };
+  }
+
+  closeTagMenu() {
+    const m = this._tagMenu;
+    if (!m) return;
+    m.menu.remove();
+    document.removeEventListener("mousedown", m.onDown, true);
+    window.removeEventListener("keydown", m.onKey, true);
+    this._tagMenu = null;
+  }
+
+  /** The speaker button's menu: a plain line, or one that names the voice.
+   *  Kept inside the editor, so a click in it doesn't count as outside. */
+  openSpeakerMenu(anchor, id, b, line, pick) {
+    this._spkMenu?.close();
+    const host = anchor.closest(".mmh3-modal") || document.body;
+    let menu;
+    const close = () => {
+      menu?.remove();
+      document.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("keydown", onKey, true);
+      this._spkMenu = null;
+    };
+    const onDown = (e) => { if (!menu.contains(e.target) && !anchor.contains(e.target)) close(); };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); e.preventDefault(); close(); } };
+    const item = (label, text, enabled, onpick) => el("button", {
+      class: "mmh3-spkitem" + (enabled ? "" : " off"), type: "button",
+      onclick: (e) => { e.stopPropagation(); if (!enabled) return; close(); onpick(); },
+    }, el("b", {}, label), el("small", {}, text));
+    menu = el("div", { class: "mmh3-spkmenu", role: "menu" },
+      item(`Just (${id})`, line(id, false), true, () => pick(false)),
+      item(`(${id}) with voice`, b.voice ? line(id, true) : `Fill in the voice box on the ${b.audio} line first`,
+        !!b.voice, () => pick(true)));
+    host.append(menu);
+    const pr = (menu.offsetParent || document.body).getBoundingClientRect();
+    const ar = anchor.getBoundingClientRect();
+    menu.style.left = `${Math.max(8, Math.min(ar.left - pr.left, pr.width - menu.offsetWidth - 8))}px`;
+    menu.style.top = `${ar.bottom - pr.top + 4}px`;
+    document.addEventListener("mousedown", onDown, true);
+    window.addEventListener("keydown", onKey, true);
+    this._spkMenu = { close };
+  }
+
+  dialogueRow(lang) {
+    this.dialogueLang = lang;          // reused by refreshDialogueRow()
+    const used = this.usedSpeakers();
+    const next = `S${used.length ? Math.max(...used.map((s) => +s.slice(1))) + 1 : 1}`;
+
+    const vo = el("button", {
+      class: "mmh3-btn" + (this.voiceover ? " primary" : ""),
+      title: "Off-screen voiceover. While on, inserted lines use the guide's " +
+             "exact phrasing and append the lips-closed clause, which is " +
+             "required on every voiceover line.",
+      onclick: () => { this.voiceover = !this.voiceover; this.render(); },
+    }, "\u{1F399} voiceover");
+
+    const binds = this.speakerBindings();
+
+    const line = (id, withVoice = false) => {
+      const b = binds[id];
+      const who = b?.name ? `${NAME_PREFIX}${b.name} ` : "";
+      const how = withVoice && b?.voice ? `, in the ${noArticle(b.voice)} referenced from ${b.audio},` : "";
+      const said = this.voiceover
+        ? `${who}(${id})${how} says in an off-screen voiceover: `
+        : `${who}(${id})${how} says: `;
+      const tail = this.voiceover
+        ? " while their lips remain completely closed."
+        : "";
+      // Deliberately NOT on its own line: the model reads a line break as a
+      // shot boundary, so only [Shot N] may introduce one. Dialogue joins the
+      // description it belongs to.
+      return `${said}<d>[${lang.value}] </d>${tail}`;
+    };
+
+    const spkBtn = (id, isNew) => {
+      const b = !isNew && binds[id];
+      if (!b) return el("button", {
+        class: "mmh3-btn" + (isNew ? " ghost" : ""),
+        title: isNew
+          ? `Add ${id} \u2014 the next speaker in the video's speaking order`
+          : `Insert a line for ${id}`,
+        onclick: () => this.insert(line(id)),
+      }, isNew ? `+ (${id})` : `(${id})`);
+      // A split button: the main part repeats this speaker's last choice,
+      // the arrow offers a plain line or one that names the voice. Each
+      // speaker remembers its own choice, saved with the prompt.
+      const picks = this.state.ref.voicePick || {};
+      const withVoice = picks[id] !== false && !!b.voice;
+      const pick = (voice) => {
+        this.state.ref.voicePick = { ...(this.state.ref.voicePick || {}), [id]: voice };
+        this.insert(line(id, voice));
+        this.refreshDialogueRow();
+      };
+      const arrow = el("button", { class: "mmh3-btn mmh3-spkarrow", title: `Line options for ${id}`,
+        "aria-label": `Line options for ${id}`,
+        onclick: (e) => { e.stopPropagation(); this.openSpeakerMenu(arrow, id, b, line, pick); } }, "\u25be");
+      return el("span", { class: "mmh3-spksplit" },
+        el("button", { class: "mmh3-btn mmh3-spkmain",
+          title: withVoice ? `Insert a line for ${id} in the voice from ${b.audio}` : `Insert a line for ${id}`,
+          onclick: () => this.insert(line(id, withVoice)) }, withVoice ? `(${id}) + voice` : `(${id})`),
+        arrow);
+    };
+
+    const pair = used.length >= 2
+      ? el("button", { class: "mmh3-btn",
+          title: "Two speakers vocalising together",
+          onclick: () => this.insert(line(`${used[0]},${used[1]}`)) },
+          `(${used[0]},${used[1]})`)
+      : null;
+
+    return el("div", { class: "mmh3-tools mmh3-dialogrow" },
+      el("span", { class: "mmh3-toollabel" }, "Dialogue:"),
+      lang,
+      ...used.map((id) => spkBtn(id, false)),
+      spkBtn(next, true),
+      pair,
+      vo,
+      el("span", { class: "mmh3-toolsep" }),
+      el("button", { class: "mmh3-btn",
+        title: "A line crossing a cut. Use it twice \u2014 once at the end of " +
+               "the pre-cut half, once at the start of the post-cut half \u2014 " +
+               "and say the audio continues.",
+        onclick: () => this.insert("<scenetrans>") }, "\u2933 scenetrans"),
+      el("button", { class: "mmh3-btn",
+        title: "Speech truncated by the end of the video",
+        onclick: () => this.insert("<cutoff>") }, "\u2301 cutoff"));
+  }
+
+  durationRow() {
+    const frames = snapLength(this.state.duration);
+    const hint = el("span", { class: "hint" },
+      `snaps to ${fmtSS(frames / 24)} s \u2022 ${frames} frames (17k+5 grid @ 24fps) \u2014 ` +
+      "use this value for the native node's length");
+    const input = el("input", {
+      type: "number", min: "0.2", max: "15", step: "0.1", style: { width: "90px" },
+      value: this.state.duration,
+      oninput: (e) => {
+        this.state.duration = parseFloat(e.target.value) || 5;
+        const f = snapLength(this.state.duration);
+        hint.textContent =
+          `snaps to ${fmtSS(f / 24)} s \u2022 ${f} frames (17k+5 grid @ 24fps) \u2014 ` +
+          "use this value for the native node's length";
+      },
+    });
+    return el("div", { class: "mmh3-sec" },
+      el("label", {}, "Video end time (s) \u2192 becomes S.SS in the instruction line"),
+      el("div", { class: "mmh3-row" }, input, hint));
+  }
+
+  naButton(obj, key) {
+    return el("button", { class: "mmh3-btn", style: { alignSelf: "flex-start" },
+      onclick: (e) => {
+        const box = e.target.closest(".mmh3-sec").querySelector("textarea");
+        if (box) {
+          box.value = "N/A";
+          // Let the field's own handlers run: they update the state and
+          // repaint the chip mirror. Assigning .value fires nothing.
+          box.dispatchEvent(new Event("input", { bubbles: true }));
+        } else {
+          obj[key] = "N/A";
+        }
+        this.updatePreview();
+      } }, "N/A");
+  }
+
+  /* ---------- mode renderers ---------- */
+
+  /** Guarded so a bad state can't leave a half-built form.
+   *
+   *  The media loader learned this the hard way (see "render failed" in its
+   *  console output): a throw partway through a build leaves stale tiles and
+   *  dead buttons with nothing on screen to explain it. Same shape here —
+   *  an unbuilt chipbar reads as "my media disappeared". */
+  render() {
+    try {
+      this._render();
+    } catch (err) {
+      console.error("[MiniMaxH3 PromptBuilder] render failed:", err);
+      toast("The editor hit an error while drawing \u2014 " +
+        "see the browser console (F12).", 8000);
+    }
+  }
+
+  _render() {
+    this._citeText = null;
+    const scroll = this.formEl.scrollTop;
+    [...this.modeBar.children].forEach((b, i) =>
+      b.classList.toggle("on", MODES[i].id === this.state.mode));
+    this._slotMap = null;                 // slots may have changed
+    (this._chipFields || []).forEach((paint) => { try { paint(); } catch (e) {} });
+    this.modeSends.textContent = MODE_SENDS[this.state.mode] || "";
+    this.modeSends.classList.toggle("gated", this.state.mode !== "REF");
+    this.formEl.replaceChildren();
+    this.refreshSlots();
+    // Fill the status slot BEFORE the form. If a form build throws, the
+    // guard catches it — but the draft banner is the one thing that must
+    // survive, because it's what tells you the node isn't holding what
+    // you're looking at. Drawing it last made it the first casualty.
+    this.draftSlot.replaceChildren(
+      this.linkOffer ? this.linkStrip()
+        : this.refmodOffer ? this.refmodLinkStrip()
+        : this.commitPending === "guard" ? this.commitStrip()
+        : this.pullPending ? this.pullStrip()
+        : (this.bufferMode === "draft" ? this.draftBar() : null) || "");
+    if (this.state.mode === "REF") this.renderRef();
+    else this.renderBase();
+    if (this.closePending) {
+      this.formEl.prepend(this.closeStrip());
+      this.formEl.scrollTop = 0;
+    } else if (this.clearPending) {
+      this.formEl.prepend(this.clearStrip());
+      this.formEl.scrollTop = 0;
+    } else this.formEl.scrollTop = scroll;
+    this.applyDraftChrome();
+    this.updatePreview();
+    this.drawPins();
+  }
+
+  renderBase() {
+    this._paintSubjChips = null;
+    const s = this.state;
+    const f = this.formEl;
+    f.append(this.toolBar());
+
+    const modeHints = {
+      T2VA: "No instruction line. Build the complete audiovisual timeline from text.",
+      I2VA: "Fixed instruction line is auto-generated. <Picture 1> is the actual first frame of [Shot 1] — anchor, then develop forward.",
+      FL2VA: "Instruction line auto-generated from duration. Describe the motion path from Picture 1 to Picture 2; favors a single shot.",
+      L2VA: "Instruction line auto-generated. Infer a plausible earlier state, then converge onto <Picture 1> in the final shot.",
+    };
+    f.append(el("div", { class: "mmh3-sec" },
+      el("span", { class: "hint" }, modeHints[s.mode])));
+
+    if (s.mode === "FL2VA" || s.mode === "L2VA") f.append(this.durationRow());
+
+    if (s.mode === "FL2VA") {
+      f.append(el("div", { class: "mmh3-sec" },
+        el("label", {}, "Picture 2 belongs to Shot"),
+        el("input", { type: "number", min: "1", step: "1", style: { width: "80px" },
+          value: s.p2Shot,
+          oninput: (e) => { s.p2Shot = parseInt(e.target.value, 10) || 1; } })));
+    }
+    if (s.mode === "L2VA") {
+      f.append(el("div", { class: "mmh3-sec" },
+        el("label", {}, "Final shot index N (Picture 1 lands here)"),
+        el("input", { type: "number", min: "1", step: "1", style: { width: "80px" },
+          value: s.lastShot,
+          oninput: (e) => { s.lastShot = parseInt(e.target.value, 10) || 1; } })));
+    }
+
+    const structures = {
+      T2VA: "style + composition \u2192 actions \u2192 cuts \u2192 dialogue/diegetic sound",
+      I2VA: "first-frame anchor \u2192 action onset \u2192 continuous development \u2192 result or reaction",
+      FL2VA: "first-frame state \u2192 observable intermediate changes \u2192 narrowing differences \u2192 last-frame state",
+      L2VA: "plausible preceding state \u2192 action/transition path \u2192 gradual convergence \u2192 last-frame landing",
+    };
+    f.append(el("div", { class: "mmh3-sec" },
+      el("label", {}, "integrated_multimodal_description"),
+      this.ta(s, "imd", 12,
+        `[Shot 1] Live-action, cinematic, ...\nRecommended: ${structures[s.mode]}`),
+      el("span", { class: "hint" },
+        "Open [Shot 1] with the overall style and initial composition. Later shots: " +
+        "\"[Shot N] At MM:SS.mmm, the shot cuts to ...\". Write camera moves as natural sentences.")));
+
+    f.append(el("div", { class: "mmh3-sec" },
+      this.secLabel("overall_soundscape"),
+      el("div", { class: "mmh3-row" },
+        this.ta(s, "soundscape", 3,
+          "1\u20134 sentences: ambience, physical action sounds, non-verbal human sounds."),
+        this.naButton(s, "soundscape"))));
+
+    f.append(el("div", { class: "mmh3-sec" },
+      this.secLabel("non_diegetic_music"),
+      el("div", { class: "mmh3-row" },
+        this.ta(s, "music", 3,
+          "1\u20133 sentences: instrumentation, tempo, rhythm, dynamics. No abstract mood words."),
+        this.naButton(s, "music"))));
+  }
+
+  renderRef() {
+    const r = this.state.ref;
+    const f = this.formEl;
+
+    const nextTagN = (kind) => {
+      const inDefs = r.subjectDefs.flatMap((d) =>
+        [...d.text.matchAll(new RegExp(`<${kind} (\\d+)>`, "g"))].map((m) => +m[1]));
+      // Prefer the lowest connected slot that isn't defined yet.
+      const connected = this.slots
+        .filter((s) => s.kind === kind && s.tag).map((s) => s.idx);
+      const free = connected.find((n) => !inDefs.includes(n));
+      return free ?? Math.max(0, ...inDefs, ...connected) + 1;
+    };
+    const nextSubjectN = () => nextTagN("Subject");
+
+    const subjChips = () => {
+      const defText = r.subjectDefs.map((d) => d.text).join("\n");
+      const ns = [...new Set([...defText.matchAll(/<Subject (\d+)>/g)].map((m) => m[1]))];
+      const names = subjectNames(this.state);
+      const nameOf = (n) => Object.values(names).find((v) => v.tag === `<Subject ${n}>`)?.name;
+      return ns.flatMap((n) => {
+        const nm = nameOf(n);
+        const chips = [el("span", {
+          class: "mmh3-chip subj", title: `Insert <Subject ${n}>`,
+          onclick: () => this.insert(`<Subject ${n}>`),
+        }, el("b", {}, `Subject ${n}`), nm ? el("span", { class: "mmh3-chipname" }, nm) : null)];
+        if (nm) chips.push(el("span", {
+          class: "mmh3-chip subj", title: `Insert ${NAME_PREFIX}${nm} \u2014 becomes "<Subject ${n}> ${nm}" in the prompt`,
+          onclick: () => this.insert(`${NAME_PREFIX}${nm}`),
+        }, el("b", {}, `${NAME_PREFIX}${nm}`)));
+        return chips;
+      });
+    };
+    const subjChipWrap = el("span", { style: { display: "contents" } });
+    this._paintSubjChips = () => subjChipWrap.replaceChildren(...subjChips());
+    this._paintSubjChips();
+    f.append(this.toolBar([subjChipWrap]));
+
+    /* subject_definitions -------------------------------------------- */
+    const defsWrap = el("div");
+
+    // Next unused speaker ID, based on IDs already bound in the definitions.
+    const nextSpeakerId = () => {
+      const used = new Set([...r.subjectDefs.map((d) => d.text).join("\n")
+        .matchAll(/\(S(\d+)\)/g)].map((m) => +m[1]));
+      let i = 1;
+      while (used.has(i)) i++;
+      return `S${i}`;
+    };
+    const firstTag = (kind, fallback) => {
+      const inDefs = r.subjectDefs.map((d) => d.text).join("\n")
+        .match(new RegExp(`<${kind} (\\d+)>`));
+      if (inDefs) return `<${kind} ${inDefs[1]}>`;
+      const slot = this.slots.find((s) => s.kind === kind && s.tag);
+      return slot ? slot.tag : fallback;
+    };
+
+    // Applying a role rewrites the definition line and keeps
+    // retention_analysis and the summary task types consistent with it.
+    const applyAudioRole = (d, n, role) => {
+      const ctx = {
+        n,
+        subj: firstTag("Subject", "<Subject 1>"),
+        vid: firstTag("Video", "<Video 1>"),
+        sx: (d.text.match(/\(S\d+\)/) || [nextSpeakerId()])[0].replace(/[()]/g, ""),
+      };
+      d.text = role.text(ctx);
+      d.role = role.id;
+
+      const label = `<Audio ${n}>`;
+      let row = r.retention.find((x) => x.label === label);
+      if (!row) { row = { label, context: "", marker: "", note: "" }; r.retention.push(row); }
+      row.marker = role.marker;
+      row.note = role.note(ctx);
+
+      if (!r.summaryTypes.includes(role.task)) r.summaryTypes.push(role.task);
+      this.render();
+    };
+
+    const applyPictureRole = (d, n, role) => {
+      const ctx = { n, subj: firstTag("Subject", "<Subject 1>"), shot: 1 };
+      d.text = role.text(ctx);
+      d.role = role.id;
+
+      const label = `<Picture ${n}>`;
+      let row = r.retention.find((x) => x.label === label);
+      if (!row) { row = { label, context: "", marker: "", note: "" }; r.retention.push(row); }
+      row.marker = role.marker;
+      row.note = role.note(ctx);
+      if (!row.context) row.context = role.context(ctx);
+
+      if (!r.summaryTypes.includes(role.task)) r.summaryTypes.push(role.task);
+      this.render();
+    };
+
+    const drawDefs = () => {
+      defsWrap.replaceChildren();
+      r.subjectDefs.forEach((d, i) => {
+        const mini = el("div", { class: "mmh3-minitags" });
+        const roleRow = el("div", { class: "mmh3-roles" });
+        const paintMini = () => {
+          mini.replaceChildren(
+            ...[...d.text.matchAll(/<(Subject|Picture|Video|Audio) (\d+)>/g)]
+              .map((m) => el("span",
+                { class: `mmh3-minitag ${TAG_CLASS[m[1]]}` }, `${m[1]} ${m[2]}`)));
+          // Lines get one-click role presets for the tag they define.
+          const am = d.text.match(/<Audio (\d+)>/);
+          const pm = d.text.trim().match(/^<Picture (\d+)>/);
+          roleRow.replaceChildren();
+          if (pm && !am) {
+            const n = pm[1];
+            roleRow.append(el("span", { class: "mmh3-rolelabel" }, "role:"));
+            PICTURE_ROLES.forEach((role) => {
+              roleRow.append(el("span", {
+                class: "mmh3-rolechip" + (d.role === role.id ? " on" : ""),
+                title: role.title + ` \u2014 sets ${role.marker} + ${role.task}`,
+                onclick: () => applyPictureRole(d, n, role),
+              }, role.label));
+            });
+          }
+          if (am) {
+            const n = am[1];
+            roleRow.append(el("span", { class: "mmh3-rolelabel" }, "role:"));
+            AUDIO_ROLES.forEach((role) => {
+              roleRow.append(el("span", {
+                class: "mmh3-rolechip" + (d.role === role.id ? " on" : ""),
+                title: role.title + ` \u2014 sets ${role.marker} + ${role.task}`,
+                onclick: () => applyAudioRole(d, n, role),
+              }, role.label));
+            });
+          }
+        };
+        const ta = el("textarea", { rows: 2, value: d.text,
+          placeholder: "<Subject 1> is the ... in <Picture 1>, with ...",
+          oninput: (e) => { d.text = e.target.value; d.role = null; paintMini(); nameIn.hidden = !/^\s*<Subject \d+>/.test(d.text); voiceIn.hidden = !voiceBinding(d.text); } });
+        // A name rides on a <Subject N> line: the prompt adds "Their name
+        // is X." and !X anywhere else becomes "<Subject N> X".
+        const nameIn = el("input", { class: "mmh3-defname", type: "text", value: d.name || "",
+          placeholder: "name", title: "Optional name for this subject. The prompt adds \u201cTheir name is \u2026\u201d " +
+            "to the line and \u201cIt is \u2026's voice\u201d to the subject's voice line, and typing " +
+            `${NAME_PREFIX}Name in any field stands for \u201c<Subject N> Name\u201d.`,
+          hidden: !/^\s*<Subject \d+>/.test(d.text || ""),
+          oninput: (e) => { keepNameChars(e); d.name = e.target.value.trim(); this._paintSubjChips?.(); this.updatePreview(); } });
+        // A voice description rides on a voice-timbre line: the prompt adds
+        // "It is a …", and the speaker button can put it into a spoken line.
+        const voiceIn = el("input", { class: "mmh3-defname mmh3-defvoice", type: "text", value: d.voice || "",
+          placeholder: "voice, like low and husky", title: "Optional description of this voice. The prompt adds " +
+            "“It is a …” to the line (“It is Name's voice: …” when its subject has a name), and the speaker " +
+            "button can insert it into a spoken line.",
+          hidden: !voiceBinding(d.text || ""),
+          oninput: (e) => { d.voice = e.target.value; this.updatePreview(); this.refreshDialogueRow(); } });
+        paintMini();
+        const row = el("div", { class: "mmh3-defrow" + (d.off ? " off" : "") },
+          this.rowPower(d, drawDefs), ta, nameIn, voiceIn,
+          el("button", { class: "mmh3-btn ghost", title: "Remove line",
+            onclick: () => { r.subjectDefs.splice(i, 1); drawDefs(); this.updatePreview(); },
+          }, "\u2715"));
+        defsWrap.append(row, mini, roleRow);
+      });
+    };
+    drawDefs();
+    const addDef = (seed) => {
+      r.subjectDefs.push({ text: seed });
+      drawDefs();
+      const t = defsWrap.querySelector(".mmh3-defrow:last-of-type textarea");
+      if (t) { t.focus(); t.selectionStart = t.selectionEnd = t.value.length; this.lastFocus = t; }
+      this.updatePreview();
+    };
+    f.append(el("div", { class: "mmh3-sec" },
+      this.secLabel("subject_definitions"),
+      defsWrap,
+      el("div", { class: "mmh3-tools" },
+        el("button", { class: "mmh3-btn",
+          onclick: () => addDef(`<Subject ${nextTagN("Subject")}> is `) }, "+ Subject"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => addDef(`<Picture ${nextTagN("Picture")}> is `) }, "+ Picture line"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => addDef(`<Video ${nextTagN("Video")}> is `) }, "+ Video line"),
+        el("button", { class: "mmh3-btn",
+          onclick: () => addDef(`<Audio ${nextTagN("Audio")}> is `) }, "+ Audio line"),
+        el("button", { class: "mmh3-btn", title: "Write a definition and a retention entry for each " +
+            "RefMod in the stack, from what the library knows about it. With lines already here you " +
+            "choose whether to add the missing ones or start over.",
+          onclick: () => this.draftFromRefmods() }, "\u25c8 Draft from RefMods")),
+      el("span", { class: "hint" },
+        "One line per tracked item. Focus a line, then click media chips above to assign " +
+        "references to that subject. Audio lines show role chips underneath \u2014 pick one " +
+        "and the definition, its retention marker, and the summary task type are filled in " +
+        "for you. Standalone <Picture N> lines are only for concrete frame anchors or " +
+        "storyboards; otherwise cite the picture inside the subject.")));
+
+    /* summary --------------------------------------------------------- */
+    f.append(el("div", { class: "mmh3-sec" },
+      el("label", {}, "summary"),
+      el("div", { class: "mmh3-ttypes" }, TASK_TYPES.map((t) =>
+        el("label", {},
+          el("input", { type: "checkbox", checked: r.summaryTypes.includes(t),
+            onchange: (e) => {
+              r.summaryTypes = e.target.checked
+                ? [...r.summaryTypes, t]
+                : r.summaryTypes.filter((x) => x !== t);
+              this.updatePreview();
+            } }), t))),
+      this.ta(r, "summaryText", 3,
+        "One short paragraph. Use the defined labels; for video editing start with " +
+        "\"The target video is an edited version of <Video 1>.\""),
+      el("span", { class: "hint" },
+        "The bracketed prefix is assembled from the checkboxes, joined with \" + \".")));
+
+    /* retention_analysis ---------------------------------------------- */
+    const retWrap = el("div");
+    // The item a definition line actually defines: the tag it opens with.
+    // Pictures merely cited inside a subject are that subject's evidence, not
+    // separate labels, so they never earn their own retention line.
+    const definedLabels = () => {
+      const seen = [];
+      r.subjectDefs.forEach((d) => {
+        const m = (d.text || "").match(/^\s*<(Subject|Picture|Video|Audio) (\d+)>/);
+        if (!m) return;
+        const tag = `<${m[1]} ${m[2]}>`;
+        if (!seen.includes(tag)) seen.push(tag);
+      });
+      return seen;
+    };
+
+    const knownLabels = () => {
+      const defText = r.subjectDefs.map((d) => d.text).join("\n");
+      const found = new Set(
+        [...defText.matchAll(/<(Subject|Picture|Video|Audio) (\d+)>/g)]
+          .map((m) => `<${m[1]} ${m[2]}>`));
+      this.slots.forEach((s) => { if (s.tag) found.add(s.tag); });
+      return [...found].sort((a, b) => {
+        const order = ["Subject", "Picture", "Video", "Audio"];
+        const [, ka, na] = a.match(/<(\w+) (\d+)>/);
+        const [, kb, nb] = b.match(/<(\w+) (\d+)>/);
+        return ka === kb ? na - nb : order.indexOf(ka) - order.indexOf(kb);
+      });
+    };
+    const drawRet = () => {
+      retWrap.replaceChildren();
+      r.retention.forEach((row, i) => {
+        const markers = row.label?.startsWith("<Audio") ? AUDIO_MARKERS : VISUAL_MARKERS;
+        if (!markers.includes(row.marker)) row.marker = markers[0];
+        retWrap.append(el("div", { class: "mmh3-retrow" + (row.off ? " off" : "") },
+          this.rowPower(row, drawRet),
+          el("select", {
+            onchange: (e) => { row.label = e.target.value; drawRet(); this.updatePreview(); } },
+            knownLabels().map((l) =>
+              el("option", { value: l, selected: l === row.label }, l))),
+          el("input", { type: "text", value: row.context,
+            dataset: { shotlist: "1" },
+            placeholder: "appears in [Shot 1], [Shot 2]  \u2014 or leave empty",
+            oninput: (e) => { row.context = e.target.value; } }),
+          el("select", {
+            onchange: (e) => { row.marker = e.target.value; this.updatePreview(); } },
+            markers.map((m) => el("option", { value: m, selected: m === row.marker }, m))),
+          el("button", { class: "mmh3-btn ghost",
+            onclick: () => { r.retention.splice(i, 1); drawRet(); this.updatePreview(); } },
+            "\u2715"),
+          el("input", { class: "mmh3-retnote", type: "text", value: row.note,
+            placeholder: (() => {
+              const hint = roleHint(definitionFor(this.state, row.label));
+              return hint ? `e.g. ${hint.note}`
+                : "what exactly is retained / transferred / referenced";
+            })(),
+            oninput: (e) => { row.note = e.target.value; } }),
+        ));
+      });
+    };
+    drawRet();
+    f.append(el("div", { class: "mmh3-sec" },
+      this.secLabel("retention_analysis"),
+      retWrap,
+      el("div", { class: "mmh3-tools" },
+        el("button", { class: "mmh3-btn", onclick: () => {
+          const labels = knownLabels();
+          if (!labels.length) { toast("Define a subject or connect media first"); return; }
+          const used = new Set(r.retention.map((x) => x.label));
+          const next = labels.find((l) => !used.has(l)) || labels[0];
+          const hint = roleHint(definitionFor(this.state, next));
+          r.retention.push({ label: next, context: "",
+            marker: hint?.marker
+              || (next.startsWith("<Audio") ? "reference" : "fully_preserved"),
+            // When the definition states the role outright, write the matching
+            // note rather than only hinting at it — the role chips already do.
+            note: hint ? hint.note : "" });
+          drawRet(); this.updatePreview();
+        } }, "+ Entry"),
+        el("button", { class: "mmh3-btn",
+          title: "One entry per item defined above \u2014 not per picture cited " +
+            "inside a subject",
+          onclick: () => {
+            const labels = definedLabels();
+            if (!labels.length) {
+              toast("Define a subject or standalone reference first", 3000);
+              return;
+            }
+            const used = new Set(r.retention.map((x) => x.label));
+            let added = 0;
+            labels.forEach((l) => {
+              if (used.has(l)) return;
+              const hint = roleHint(definitionFor(this.state, l));
+              r.retention.push({ label: l, context: "",
+                marker: hint?.marker
+                  || (l.startsWith("<Audio") ? "reference" : "fully_preserved"),
+                note: hint ? hint.note : "" });
+              added += 1;
+            });
+            drawRet(); this.updatePreview();
+            if (!added) toast("Every defined label already has an entry", 2600);
+          } }, "Auto-fill from labels")),
+      el("span", { class: "hint" },
+        "Visual labels: fully_preserved / partially_preserved / attribute_transfer / " +
+        "weak_reference. Audio labels: fully_copy / partially_copy / reference / weak_reference.")));
+
+    /* detailed_description --------------------------------------------- */
+    const wcSpan = el("span", { class: "hint" });
+    const paintWc = () => {
+      const wc = r.detail.trim() ? r.detail.trim().split(/\s+/).length : 0;
+      wcSpan.textContent = `${wc} words \u2014 generation tasks normally 350\u2013500. ` +
+        "First appearance of each <Subject N>: describe its referenced traits, frame " +
+        "position, and current action.";
+    };
+    paintWc();
+    const detTa = this.ta(r, "detail", 14,
+      "[Shot 1] A medium shot establishes <Subject 1>, ...\n[Shot 2] At 00:03.000, the shot cuts to ...");
+    detTa.addEventListener("input", paintWc);
+    f.append(el("div", { class: "mmh3-sec" },
+      el("label", {}, "detailed_description \u2014 style opening (before [Shot 1])"),
+      this.ta(r, "styleLine", 2,
+        "The target video is in a realistic multi-camera sitcom style with warm indoor lighting.")));
+    f.append(el("div", { class: "mmh3-sec" },
+      el("label", {}, "detailed_description \u2014 shots"),
+      detTa, wcSpan));
+
+    /* audio sections ---------------------------------------------------- */
+    f.append(el("div", { class: "mmh3-sec" },
+      this.secLabel("overall_soundscape"),
+      el("div", { class: "mmh3-row" },
+        this.ta(r, "soundscape", 3,
+          "Ambience + physical sounds. If copying ambience: \"The copied ambience layer " +
+          "from <Audio 1> continues throughout the target video.\""),
+        this.naButton(r, "soundscape"))));
+    f.append(el("div", { class: "mmh3-sec" },
+      this.secLabel("non_diegetic_music"),
+      el("div", { class: "mmh3-row" },
+        this.ta(r, "music", 3,
+          "Audience-only score. If reused: \"<Audio 2> is directly reused as the complete " +
+          "audience-only score.\""),
+        this.naButton(r, "music"))));
+  }
+
+  /* ---------- preview + validation ---------- */
+
+  /** Small on/off switch for a single line. Off keeps the row in the editor
+   *  but leaves it out of the prompt — for when the media it describes is
+   *  temporarily unplugged. */
+  rowPower(obj, redraw) {
+    const dot = el("span", {
+      class: "mmh3-rowpow" + (obj.off ? "" : " on"),
+      title: obj.off ? "Left out of the prompt \u2014 click to include"
+                     : "Included \u2014 click to leave out of the prompt",
+      onclick: () => {
+        obj.off = !obj.off;
+        redraw();
+        this.updatePreview();
+      },
+    }, obj.off ? "\u25cb" : "\u25c9");
+    return dot;
+  }
+
+  /** Section heading with an on/off switch. Off keeps the text but stops the
+   *  section reaching the prompt — handy while media comes and goes. */
+  secLabel(name, text) {
+    const state = this.state;
+    state.off = state.off || {};
+    const on = !state.off[name];
+    const dot = el("span", {
+      class: "mmh3-secpow" + (on ? " on" : ""),
+      title: on ? "Included \u2014 click to leave it out of the prompt"
+                : "Left out of the prompt \u2014 click to include it again",
+      onclick: () => {
+        if (state.off[name]) delete state.off[name];
+        else state.off[name] = true;
+        this.render();
+        this.updatePreview();
+      },
+    }, on ? "\u25c9" : "\u25cb");
+    return el("label", { class: on ? "" : "off" }, dot, text || name);
+  }
+
+  updatePreview() {
+    this.scheduleDraftSave();      // no-op outside draft mode
+    this.refreshDialogueRow();     // speaker buttons follow the text
+    this._paintSubjChips?.();
+    const text = generate(this.state);
+    this._citeText = text;
+    let html = escapeHtml(text)
+      .replace(/&lt;(Subject|Picture|Video|Audio) (\d+)&gt;/g,
+        (m, k, n) => `<span class="t-${TAG_CLASS[k]}">&lt;${k} ${n}&gt;</span>`)
+      .replace(/\[Shot (\d+)\]/g, '<span class="t-shot">[Shot $1]</span>')
+      .replace(/&lt;(\/?d|scenetrans|cutoff)&gt;/g, '<span class="t-d">&lt;$1&gt;</span>');
+    this.previewEl.innerHTML = html;
+
+    const rank = { error: 0, warn: 1, info: 2 };
+    const icon = { error: "\u26d4 ", warn: "\u26a0 ", info: "\u2139 " };
+    const issues = validate(this.state, this.slots);
+    if (this.state.mode === "REF") {
+      const edit = this.editItem();
+      if (!edit && this.state.ref.summaryTypes.includes("video editing"))
+        issues.push({ level: "warn", msg: "\u201cvideo editing\u201d is ticked but no clip has a mask, so the whole " +
+          "video will be regenerated. Mask the clip in the Media Loader (right-click \u2192 Mask for editing)." });
+      const cost = edit ? Math.round(refTokenEstimate(edit)) : 0;
+      if (cost > 30000)
+        issues.push({ level: "warn", msg: `Citing the clip being edited adds about ${cost.toLocaleString()} ` +
+          "reference tokens to every sampling step. Trim it, or turn on crop to mask in its mask settings to cite only " +
+          "the area around the mask." });
+    }
+    issues.sort((a, b) => rank[a.level] - rank[b.level]);
+    this.issuesEl.replaceChildren(...(issues.length
+      ? issues.map((i) => el("div", { class: i.level }, icon[i.level] + i.msg))
+      : [el("div", { class: "ok" }, "\u2713 No issues found")]));
+
+    let stats = `${text.length} chars`;
+    if (this.state.mode === "FL2VA" || this.state.mode === "L2VA") {
+      const frames = snapLength(this.state.duration);
+      stats += ` \u2022 length ${frames} (${fmtSS(frames / 24)}s)`;
+    } else {
+      const cuts = [...text.matchAll(/At (\d{2}):(\d{2})\.(\d{3})/g)];
+      if (cuts.length) {
+        const last = cuts[cuts.length - 1];
+        const sec = tsToMs(last[1], last[2], last[3]) / 1000;
+        const L = minLengthAfter(sec);
+        stats += ` \u2022 last cut ${fmtTimestamp(sec)} \u2192 length \u2265 ${L} (${fmtSS(L / 24)}s)`;
+      }
+    }
+    this.statsEl.textContent = stats;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Node integration                                                    */
+/* ------------------------------------------------------------------ */
+
+function hideWidget(node, name) {
+  const w = node.widgets?.find((w) => w.name === name);
+  if (!w) return;
+  w.hidden = true;                       // respected by the new frontend
+  w.computeSize = () => [0, -4];         // legacy layout fallback
+  w.type = "hidden";
+  if (w.inputEl) w.inputEl.style.display = "none";
+  if (w.element) w.element.style.display = "none";
+}
+
+/** The one place this file links two nodes. Never across a subgraph's edge:
+ *  LiteGraph would write a link the other graph can't resolve. */
+function wire(from, outSlot, to, inSlot) {
+  if (from.graph !== to.graph) return null;
+  return linkNodes(from, outSlot, to, inSlot);
+}
+
+function redraw(node) {
+  try {
+    node.setDirtyCanvas?.(true, true);
+    app.graph.setDirtyCanvas(true, true);
+  } catch (e) { /* Vue redraws itself */ }
+}
+
+/** Pass this builder's media on to a Text Encode whose references input is
+ *  empty, when the builder has a Media Loader. Returns true if it wired. */
+function feedEncoderMedia(node, enc) {
+  const refIn = (node.inputs || []).findIndex((i) => i.name === "references");
+  const refOut = (node.outputs || []).findIndex((o) => o.name === "references");
+  const ri = (enc.inputs || []).findIndex((i) => i.name === "references");
+  if (refIn < 0 || refOut < 0 || ri < 0) return false;
+  if (node.inputs[refIn].link == null || enc.inputs[ri].link != null) return false;
+  return !!wire(node, refOut, enc, ri);
+}
+
+/** Wire a RefMod Stack into this builder's mods input. Focuses the stack
+ *  already there; otherwise adopts one already feeding a RefMod Text Encode
+ *  this prompt drives, or creates a new one beside the node and passes the
+ *  builder's mods output on to any such Text Encode whose mods input is
+ *  empty. Returns the stack, or null. */
+function addRefModStack(node, { focus = true } = {}) {
+  const inIdx = (node.inputs || []).findIndex((i) => i.name === "mods");
+  const outIdx = (node.outputs || []).findIndex((o) => o.name === "mods");
+  if (inIdx < 0 || outIdx < 0) {
+    toast("This Prompt Builder has no mods input \u2014 restart ComfyUI and reload the page", 6000);
+    return null;
+  }
+
+  if (node.inputs[inIdx].link != null) {
+    const { stack } = refmodStackFor(node);
+    // An older workflow may have the stack but not the media wire: finish it.
+    const fed = encodersOf(node).filter((enc) => feedEncoderMedia(node, enc)).length;
+    if (fed) redraw(node);
+    if (stack && focus && !safeCanvasFocus(stack))
+      openStackModal(stack, { onClose: () => updateSummary(node) });
+    if (!stack) toast("Something other than a RefMod Stack is on this node's mods input");
+    else if (focus) toast(fed ? "RefMod Stack already connected \u2014 wired this node's media on to RefMod Text Encode too"
+                              : "A RefMod Stack is already connected");
+    return stack;
+  }
+
+  const encoders = outputTargets(node, 0).filter((n) => ENCODE_NAMES.has(n?.type));
+  const modsInput = (enc) => (enc.inputs || []).findIndex((i) => i.name === "mods");
+  for (const enc of encoders) {
+    const mi = modsInput(enc);
+    const head = mi >= 0 && enc.inputs[mi].link != null ? originNode(enc, mi) : null;
+    if (head?.type === STACK_NAME && wire(head, 0, node, inIdx)) {     // slot 0 is the stack's mods bundle
+      feedEncoderMedia(node, enc);
+      redraw(node);
+      toast("Connected the RefMod Stack that already feeds RefMod Text Encode");
+      return head;
+    }
+  }
+
+  let stack = null;
+  try {
+    stack = LiteGraph.createNode(STACK_NAME);
+  } catch (e) { stack = null; }
+  if (!stack) {
+    toast("RefMod Stack node not found \u2014 restart ComfyUI");
+    return null;
+  }
+  node.graph.add(stack);
+  try {
+    // Left of the builder like the Media Loader, below it when one is there.
+    const refIdx = (node.inputs || []).findIndex((i) => i.name === "references");
+    const loader = refIdx >= 0 && node.inputs[refIdx].link != null ? originNode(node, refIdx) : null;
+    const x = node.pos[0] - ((stack.size?.[0] || 560) + 60);
+    const y = loader?.graph === node.graph ? loader.pos[1] + (loader.size?.[1] || 400) + 60 : node.pos[1];
+    stack.pos = [x, y];
+  } catch (e) { /* let the renderer place it */ }
+  wire(stack, 0, node, inIdx);
+  let fed = 0;
+  for (const enc of encoders) {
+    const mi = modsInput(enc);
+    if (mi >= 0 && enc.inputs[mi].link == null && wire(node, outIdx, enc, mi)) fed++;
+    feedEncoderMedia(node, enc);
+  }
+  redraw(node);
+  toast(fed
+    ? "RefMod Stack added and connected \u2014 its bundle goes on to RefMod Text Encode"
+    : "RefMod Stack added and connected. Wire this node's mods output into " +
+      "RefMod Text Encode's mods input.", 6000);
+  return stack;
+}
+
+/** Create a Media Loader beside this node and connect it, or focus the
+ *  existing one if the references input is already wired. */
+function addMediaLoader(node) {
+  const inIdx = (node.inputs || []).findIndex((i) => i.name === "references");
+  if (inIdx < 0) { toast("This node has no references input"); return; }
+
+  const existing = node.inputs[inIdx].link != null ? originNode(node, inIdx) : null;
+  if (existing) {
+    // An older workflow may have the loader but not pass its media on to a
+    // RefMod Text Encode: finish that wire before focusing the loader.
+    const fed = encodersOf(node).filter((enc) => feedEncoderMedia(node, enc)).length;
+    if (fed) redraw(node);
+    // Focusing the canvas is renderer-specific; open its editor if that fails.
+    if (!safeCanvasFocus(existing)) openLoaderModal(existing, {});
+    toast(fed ? "Media Loader already connected \u2014 wired its media on to RefMod Text Encode too"
+              : "Media Loader is already connected");
+    return;
+  }
+
+  let loader = null;
+  try {
+    loader = LiteGraph.createNode(LOADER_NAME);
+  } catch (e) { loader = null; }
+  if (!loader) {
+    toast("Media Loader node not found \u2014 restart ComfyUI");
+    return;
+  }
+  node.graph.add(loader);
+  try {
+    loader.pos = [node.pos[0] - ((loader.size?.[0] || 430) + 60), node.pos[1]];
+  } catch (e) { /* let the renderer place it */ }
+  wire(loader, 0, node, inIdx);   // slot 0 is the references bundle
+  const fed = encodersOf(node).filter((enc) => feedEncoderMedia(node, enc)).length;
+  redraw(node);
+  toast(fed ? "Media Loader added and connected \u2014 its media goes on to RefMod Text Encode"
+            : "Media Loader added and connected");
+}
+
+function openEditor(node) {
+  try {
+    new Editor(node);
+  } catch (err) {
+    console.error("[MiniMaxH3 PromptBuilder] failed to open editor:", err);
+    toast(`Couldn't open the editor: ${err?.message || err}. ` +
+      "See the browser console (F12) for details.", 8000);
+  }
+}
+
+function updateSummary(node) {
+  if (!node._mmh3Summary) return;
+  const state = loadState(node);
+  const pw = node.widgets?.find((w) => w.name === "prompt_text");
+  const text = (pw?.value || "").trim();
+  const allSlots = getRefSlots(node);
+  const refs = allSlots.filter((s) => s.tag).length;
+  const orphans = allSlots.filter((s) => s.orphan != null).length;
+  const first = text ? escapeHtml(text.split("\n").find((l) => l.trim()) || "").slice(0, 110)
+    : "<i>empty \u2014 click Edit prompt</i>";
+  const durSeg = (state.mode === "FL2VA" || state.mode === "L2VA")
+    ? ` \u2022 ${fmtSS(snapLength(state.duration) / 24)}s (${snapLength(state.duration)}f)`
+    : "";
+  const cap = MODE_CAPACITY[state.mode] || {};
+  let refSeg = refs
+    ? ` \u2022 ${refs} ref${refs > 1 ? "s" : ""}${allSlots.bundled ? " (loader)" : ""}`
+    : "";
+  if (state.mode === "REF" && cap.total && refs > cap.total)
+    refSeg = ` \u2022 <span style="color:#f07070">${refs} refs \u2014 over the ` +
+      `${cap.total} limit</span>`;
+  if (orphans)
+    refSeg += ` \u2022 <span style="color:#f07070">${orphans} unpaired ` +
+      `soundtrack${orphans > 1 ? "s" : ""}</span>`;
+  const draftSeg = node._mmh3DraftActive
+    ? ` \u2022 <span style="color:#3fb2a8">draft in progress</span>` : "";
+  node._mmh3Summary.innerHTML =
+    `<b>${state.mode === "REF" ? "Full-reference" : state.mode}</b>` +
+    durSeg + refSeg + draftSeg +
+    `<br>${first}${text.length > 110 ? "\u2026" : ""}`;
+}
+
+app.registerExtension({
+  name: "MiniMaxH3.PromptBuilder",
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData.name !== NODE_NAME) return;
+    console.log("[MiniMaxH3 PromptBuilder] extension registered");
+
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      try {
+        const r = onNodeCreated?.apply(this, arguments);
+        injectCSS();
+        hideWidget(this, "prompt_text");
+        hideWidget(this, "builder_state");
+
+        // A saved draft should show on the node without opening the
+        // editor — one light POST per builder node per workflow load.
+        setTimeout(() => {
+          if (this.properties?.mmh3_draft_id) {
+            draftApi("/load", { id: this.properties.mmh3_draft_id })
+              .then((res) => {
+                this._mmh3DraftActive = !!res.exists;
+                if (res.exists) updateSummary(this);
+              }).catch(() => {});
+          }
+        }, 0);
+
+        // Canvas buttons first so no DOM widget can sit on top of them.
+        this.addWidget("button", "Edit prompt\u2026", null, () => openEditor(this));
+        this.addWidget("button", "+ Media loader", null, () => addMediaLoader(this));
+        this.addWidget("button", "+ RefMods", null, () => addRefModStack(this));
+
+        // Clickable DOM summary as a second, layout-independent way in.
+        if (this.addDOMWidget) {
+          const summary = el("div", {
+            class: "mmh3-summary",
+            title: "Open the prompt editor",
+            style: { cursor: "pointer", height: "46px", minHeight: "46px" },
+            onclick: () => openEditor(this),
+          });
+          this._mmh3Summary = summary;
+          // Not in the properties panel: it would squeeze this to its own width.
+          const sw = this.addDOMWidget("mmh3_summary", "div", summary,
+            { serialize: false, hideInPanel: true });
+          // Explicit height so either renderer reserves space for it.
+          sw.computedHeight = 46;
+          sw.computeSize = () => [330, 46];
+        }
+
+        try { this.size[0] = Math.max(this.size[0], 330); } catch (e) { /* Vue sizes it */ }
+        setTimeout(() => updateSummary(this), 0);
+        return r;
+      } catch (err) {
+        // Without this the node still registers but none of the UI
+        // appears, which looks like "the node did not load".
+        console.error("[Fantastic H3 Prompt Builder] setup failed for this node:", err);
+        try { this.addWidget("button", "\u26a0 UI failed \u2014 click", null, () => {
+          alert("Fantastic H3 Prompt Builder could not build its interface.\n\n" + err +
+            "\n\nOpen the browser console for the full trace.");
+        }); } catch (e2) { /* nothing more we can do */ }
+        return undefined;
+      }
+
+    };
+
+    // Canvas-only convenience; the button and summary panel are the
+    // renderer-independent ways in.
+    const onDblClick = nodeType.prototype.onDblClick;
+    nodeType.prototype.onDblClick = function (e, pos, canvas) {
+      openEditor(this);
+      return onDblClick?.apply(this, arguments) ?? true;
+    };
+
+    const onConfigure = nodeType.prototype.onConfigure;
+    nodeType.prototype.onConfigure = function () {
+      const r = onConfigure?.apply(this, arguments);
+      setTimeout(() => updateSummary(this), 0);
+      return r;
+    };
+
+    const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function () {
+      const r = onConnectionsChange?.apply(this, arguments);
+      setTimeout(() => { updateSummary(this); refreshStackLabels(); }, 0);
+      return r;
+    };
+  },
+});
+
+/* ------------------------------------------------------------------ */
+/* RefMod Text Encode: its references, in the order the model reads them */
+/* ------------------------------------------------------------------ */
+
+const ENCODE_NODE = "MiniMaxH3FantasticRefModTextEncode";
+// match the .mmh3-reforder CSS: past ORDER_ROWS lines the list scrolls
+const ORDER_ROWS = 10, ORDER_ROW_H = 20, ORDER_HEAD_H = 24, ORDER_FRAME_H = 10;
+const orderPanels = new Set();
+let orderTimer = 0;
+
+/** What to say under the list: [line, its tooltip] pairs. */
+function orderNotes({ rows, partial, withheld, linked }) {
+  return [
+    rows.length || partial ? null : linked
+      ? ["No references yet.", "Nothing is in the media or RefMods feeding this node."]
+      : ["Nothing connected to references or mods.",
+        "Wire a Media Loader or Prompt Builder to references, or a RefMod Stack to mods."],
+    withheld ? [`${withheld} media item${withheld === 1 ? "" : "s"} held back by the builder's mode.`,
+      "The Prompt Builder's mode doesn't pass these on to the Text Encode."] : null,
+    partial ? ["May be incomplete: a source can't be read.",
+      "Something feeding this node is a node the list can't look into."] : null].filter(Boolean);
+}
+
+/** Every reference on a Text Encode as its small preview, in the order the
+ *  model reads them: media as the Media Loader shows it, cropped ones with
+ *  the crop marked, and RefMods with their tags and tokens. A clip's
+ *  soundtrack and a RefMod's voice share their card. */
+function openRefThumbs(enc) {
+  injectCSS();
+  injectLoaderCSS();
+  const found = encodeSlots(enc);
+  const players = [], overlays = [];
+  const close = () => {
+    window.removeEventListener("keydown", onKey);
+    players.forEach((p) => p.stop());
+    overlays.forEach((o) => o.detach());
+    over.remove();
+  };
+  // Escape closes a lightbox opened from here first
+  const onKey = (e) => { if (e.key === "Escape" && !document.querySelector(".mml-light")) close(); };
+  const art = (c) => {
+    const it = c.item, vtag = c.tags.find((t) => t.kind === "Video")?.tag || c.tags[0].tag;
+    if (c.refmod) return el("div", { class: "mmh3-thumbart" }, c.preview
+      ? el("img", { class: "mmh3-thumbimg", src: refmodPreviewURL(c.preview), alt: "" })
+      : el("span", { class: "mmh3-dim" }, "no preview image"));
+    if (it?.kind === "picture") return el("div", { class: "mmh3-thumbart mml-slot filled pic" },
+      picturePreview(it, { onclick: () => lightbox(it, vtag) }));
+    if (it?.kind === "video") {
+      const { wrap, overlay } = clipPreview(it, { onclick: () => lightbox(it, vtag) });
+      if (overlay) overlays.push(overlay);
+      return el("div", { class: "mmh3-thumbart" }, wrap);
+    }
+    const p = c.preview;
+    if (p?.type === "img") return el("div", { class: "mmh3-thumbart" }, el("img", { class: "mmh3-thumbimg", src: p.url, alt: "" }));
+    if (p?.type === "video") return el("div", { class: "mmh3-thumbart" }, el("video", { class: "mmh3-thumbimg", src: p.url,
+      muted: true, preload: "metadata", onmouseenter: (e) => e.target.play().catch(() => {}), onmouseleave: (e) => e.target.pause() }));
+    if (!p?.url) return el("div", { class: "mmh3-thumbart" }, el("span", { class: "mmh3-dim" }, "no preview"));
+    const player = miniPlayer(p.url);
+    players.push(player);
+    return el("div", { class: "mmh3-thumbart" }, el("div", { class: "mml-row" }, player.btn, player.bar, player.time));
+  };
+  const line = (t) => el("div", { class: "mmh3-thumbtag" },
+    el("span", { class: `tag ${TAG_CLASS[t.kind]}` }, t.tag),
+    el("span", { class: "more" }, [t.more, t.tokens ? `${t.tokens.toLocaleString("en-US")} tok` : ""].filter(Boolean).join(" · ")));
+  const body = [];
+  let group = null, grid = null;
+  for (const c of found.cards) {
+    if (c.group !== group) {
+      group = c.group;
+      grid = el("div", { class: "mmh3-thumbgrid" });
+      body.push(el("div", { class: "mmh3-thumbsec" }, group), grid);
+    }
+    grid.append(el("div", { class: "mmh3-thumbcard" }, art(c),
+      el("div", { class: "mmh3-thumbname", title: c.name }, c.name), c.tags.map(line)));
+  }
+  for (const [t, more] of orderNotes(found)) body.push(el("div", { class: "mmh3-reforder-note", title: more }, t));
+  const over = el("div", { class: "mmh3-overlay", onmousedown: (e) => { if (e.target === over) close(); } },
+    el("div", { class: "mmh3-modal mmh3-thumbs", role: "dialog", "aria-label": "Reference thumbnails" },
+      el("div", { class: "mmh3-head" },
+        el("span", { class: "mmh3-title" }, "References, in the order the model reads them"),
+        el("button", { class: "mmh3-x", title: "Close", onclick: close }, "✕")),
+      el("div", { class: "mmh3-thumbscroll" }, body)));
+  window.addEventListener("keydown", onKey);
+  document.body.append(over);
+}
+
+/** A live list on the Text Encode of what it will present, worked out from
+ *  the graph, so the order can be checked without queueing a run. Folds
+ *  away with a click on its heading; that's saved with the workflow. */
+class RefOrderPanel {
+  constructor(node) {
+    this.node = node;
+    this.key = null;
+    this.caret = el("span", { class: "caret" });
+    // keep the wheel only while the list has more to show; Nodes 2.0 sends
+    // it to the canvas unless the list was clicked first (data-capture-wheel)
+    this.list = el("div", { class: "mmh3-reforder-list", tabIndex: -1, dataset: { captureWheel: "true" }, onwheel: (e) => {
+      if (this.list.scrollHeight > this.list.clientHeight && !e.ctrlKey && !e.metaKey
+        && Math.abs(e.deltaY) >= Math.abs(e.deltaX)) e.stopPropagation();
+    } });
+    this.note = el("div", { class: "mmh3-reforder-note" });
+    this.thumbs = el("button", { class: "mmh3-reforder-thumbs", title: "See every reference as a picture, in the order the model reads them",
+      onclick: (e) => { e.stopPropagation(); openRefThumbs(node); } }, "▦ Thumbnails…");
+    this.root = el("div", { class: "mmh3-reforder" },
+      el("div", { class: "mmh3-reforder-head", title: "Media from the references input comes first, then the RefMods from mods",
+        onclick: () => { node.properties.mmh3RefOrderOpen = !this.open; this.refresh(); } },
+        this.caret, el("span", { class: "title" }, "References, in model order"), this.thumbs),
+      this.list, this.note);
+    // Not in the properties panel: it would squeeze this to its own width.
+    this.widget = node.addDOMWidget("mmh3_reforder", "div", this.root, { serialize: false, hideInPanel: true });
+    this.widget.computeSize = (w) => [w, this.height];
+    this.fit(0);
+  }
+
+  get open() { return this.node.properties?.mmh3RefOrderOpen !== false; }
+
+  /** Height for the heading and `lines` rows. The canvas renderer takes
+   *  the widget's margin off above and below. */
+  fit(lines) {
+    this.height = ORDER_HEAD_H + ORDER_FRAME_H + ORDER_ROW_H * lines + 2 * this.widget.margin;
+    this.widget.computedHeight = this.height;
+  }
+
+  /** Redraw when what the node would present has changed. */
+  refresh() {
+    const found = encodeSlots(this.node), rows = found.rows, notes = orderNotes(found);
+    const key = JSON.stringify([this.open, rows, notes]);
+    if (key === this.key) return;
+    this.key = key;
+    this.caret.textContent = this.open ? "\u25be" : "\u25b8";
+    this.thumbs.disabled = !rows.length;
+    const lines = [];
+    let group = null;
+    if (this.open) rows.forEach((r, i) => {
+      if (r.group !== group) lines.push(el("div", { class: "mmh3-reforder-group" }, group = r.group));
+      lines.push(el("div", { class: "mmh3-reforder-row" },
+        el("span", { class: "num" }, `${i + 1}`),
+        el("span", { class: `tag ${TAG_CLASS[r.kind]}` }, r.tag),
+        el("span", { class: "name", title: r.more ? `${r.name} \u00b7 ${r.more}` : r.name }, r.name,
+          r.more ? el("span", { class: "more" }, ` \u00b7 ${r.more}`) : null)));
+    });
+    this.list.replaceChildren(...lines);
+    this.note.replaceChildren(...(this.open ? notes.map(([t, more]) => el("div", { title: more }, t)) : []));
+    this.fit(this.open ? Math.min(lines.length, ORDER_ROWS) + notes.length : 0);
+    try { this.node.setSize([this.node.size[0], this.node.computeSize()[1]]); } catch (e) { /* Vue sizes it */ }
+    this.node.setDirtyCanvas?.(true, true);
+  }
+}
+
+const MAP_NODE = "MiniMaxH3FantasticReferenceMap";
+// a long name scrolls sideways, so the box keeps room for that scrollbar
+const MAP_ROWS = 12, MAP_LINE_H = 18, MAP_BOX_EXTRA = 20;
+
+/** The Reference Map node's output, kept live from the graph, so the map can
+ *  go to an LLM before anything is queued. */
+class MapBox {
+  constructor(node) {
+    this.node = node;
+    this.key = null;
+    this.text = "";
+    // keep the wheel only while the box has more to show; Nodes 2.0 sends it
+    // to the canvas unless the box was clicked first (data-capture-wheel)
+    this.box = el("textarea", { class: "mmh3-mapbox-text", readOnly: true, spellcheck: false,
+      dataset: { captureWheel: "true" }, onwheel: (e) => {
+        if (this.box.scrollHeight > this.box.clientHeight && !e.ctrlKey && !e.metaKey
+          && Math.abs(e.deltaY) >= Math.abs(e.deltaX)) e.stopPropagation();
+      } });
+    this.note = el("div", { class: "mmh3-reforder-note" });
+    this.root = el("div", { class: "mmh3-reforder mmh3-mapbox" },
+      el("div", { class: "mmh3-reforder-head" },
+        el("span", { class: "title" }, "Updates as you edit the graph"),
+        el("button", { class: "mmh3-reforder-thumbs", title: "Copy the reference map as text, for pasting into an LLM",
+          onclick: async (e) => {
+            e.stopPropagation();
+            toast(await copyText(this.text) ? "Reference map copied"
+              : "Couldn't reach the clipboard — select the text in the box and copy it", 3000);
+          } }, "⧉ Copy")),
+      this.box, this.note);
+    // Not in the properties panel: it would squeeze this to its own width.
+    this.widget = node.addDOMWidget("mmh3_mapbox", "div", this.root, { serialize: false, hideInPanel: true });
+    this.widget.computeSize = (w) => [w, this.height];
+    this.fit(1, 0);
+  }
+
+  fit(lines, notes) {
+    const rows = Math.min(Math.max(lines, 1), MAP_ROWS);
+    this.box.style.height = `${rows * MAP_LINE_H + MAP_BOX_EXTRA}px`;
+    this.height = ORDER_HEAD_H + ORDER_FRAME_H + rows * MAP_LINE_H + MAP_BOX_EXTRA + ORDER_ROW_H * notes + 2 * this.widget.margin;
+    this.widget.computedHeight = this.height;
+  }
+
+  refresh() {
+    const found = encodeSlots(this.node), notes = orderNotes(found);
+    const text = found.lines.join("\n") || "No references.";
+    const key = JSON.stringify([text, notes]);
+    if (key === this.key) return;
+    this.key = key;
+    this.text = text;
+    this.box.value = text;
+    this.note.replaceChildren(...notes.map(([t, more]) => el("div", { title: more }, t)));
+    this.fit(found.lines.length, notes.length);
+    try { this.node.setSize([this.node.size[0], this.node.computeSize()[1]]); } catch (e) { /* Vue sizes it */ }
+    this.node.setDirtyCanvas?.(true, true);
+  }
+}
+
+/** Panels recheck once a second, which catches every change upstream:
+ *  media, picks, the builder's mode, links anywhere in the chain. */
+function watchOrder(panel) {
+  orderPanels.add(panel);
+  if (orderTimer) return;
+  orderTimer = setInterval(() => {
+    if (document.hidden) return;
+    for (const p of orderPanels) p.refresh();
+  }, 1000);
+}
+
+app.registerExtension({
+  name: "MiniMaxH3.TextEncodeOrder",
+  async beforeRegisterNodeDef(nodeType, nodeData) {
+    if (nodeData.name !== ENCODE_NODE && nodeData.name !== MAP_NODE) return;
+    const Panel = nodeData.name === ENCODE_NODE ? RefOrderPanel : MapBox;
+    const onNodeCreated = nodeType.prototype.onNodeCreated;
+    nodeType.prototype.onNodeCreated = function () {
+      const r = onNodeCreated?.apply(this, arguments);
+      injectCSS();
+      const panel = this._mmh3Order = new Panel(this);
+      if (Panel === MapBox) this.size[0] = Math.max(this.size[0], 480);
+      watchOrder(panel);
+      setTimeout(() => panel.refresh(), 0);
+      return r;
+    };
+    const onRemoved = nodeType.prototype.onRemoved;
+    nodeType.prototype.onRemoved = function () {
+      orderPanels.delete(this._mmh3Order);
+      return onRemoved?.apply(this, arguments);
+    };
+    const onConnectionsChange = nodeType.prototype.onConnectionsChange;
+    nodeType.prototype.onConnectionsChange = function () {
+      const r = onConnectionsChange?.apply(this, arguments);
+      setTimeout(() => this._mmh3Order?.refresh(), 0);
+      return r;
+    };
+  },
+});

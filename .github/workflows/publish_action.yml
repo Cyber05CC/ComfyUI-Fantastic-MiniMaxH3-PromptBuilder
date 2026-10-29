@@ -1,0 +1,26 @@
+name: Publish to Comfy registry
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+
+jobs:
+  publish-node:
+    name: Publish Custom Node to registry
+    runs-on: ubuntu-latest
+    # The publish action never passes a changelog on its own; set this
+    # before the version-bump push, since registry versions are immutable.
+    env:
+      COMFY_NODE_CHANGELOG: |
+        Subgraphs: the Prompt Builder, the Text Encode's reference list, the Reference Map and the RefMod Stack chain see media and RefMods across subgraphs, KJNodes Set/Get pairs included, and the + buttons add their node in the same subgraph. Clean up no longer counts the masks of a Media Loader inside a subgraph as unused. Paste files with Ctrl+V into a selected Media Loader, the loader window or the RefMod Create tab. Loading a file that's already there reuses it, and RefMod Create uploads are deleted once the RefMod is made. New Fantastic H3 Reference Cache (experimental): skips most of the references' work between refreshes for faster steps, at a RAM cost and with results that differ from a normal run. Fixes: node panels no longer squeeze into a narrow column with ComfyUI's properties panel open, and RefMod Inspect no longer stops the queue when comfyui_queue_manager is installed.
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Publish Custom Node
+        uses: Comfy-Org/publish-node-action@main
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
